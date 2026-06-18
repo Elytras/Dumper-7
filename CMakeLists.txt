@@ -12,6 +12,17 @@ endif()
 
 project(Dumper-7 LANGUAGES CXX C)
 
+# Dumper-7 depends on the MSVC ABI + MS language extensions. Only MSVC (cl.exe)
+# and Clang in MS-compatible mode (the "clang" preset) are supported. MinGW/GCC
+# lacks the MS-compat layer and will fail deep in the SDK with cryptic errors,
+# so reject it up front with a clear message.
+if(MINGW OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR
+        "MinGW/GCC is not supported. Build with MSVC (use --preset vs2022) or "
+        "Clang in MS-compatible mode (use --preset clang). "
+        "Detected compiler: ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER}).")
+endif()
+
 include(${CMAKE_SOURCE_DIR}/cmake/common.cmake)
 
 # Source files - automatic search for all source files

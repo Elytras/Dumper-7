@@ -65,6 +65,8 @@ void Generator::InitEngineCore()
 	Off::InSDK::Text::InitFTextCtorFString();                // Relies on UFunction::ExecFunction (set by Off::Init)
 	Off::InSDK::Engine::InitUGameEngineTick();               // Relies on PEIndex (set by InitPE) and UClass::CDO (set by Off::Init)
 	Off::InSDK::Construct::InitStaticConstructObjectInternal();
+	Off::InSDK::ScriptVM::InitScriptVM();                    // Pure signature scan; no engine deps
+	Off::InSDK::ScriptContainers::InitScriptContainers();    // Pure signature scan; no engine deps
 
 	InitSettings();
 }

@@ -174,6 +174,12 @@ R"(
 
 		/* Whether StaticConstructObject_Internal offset was located */
 		inline bool bHasStaticConstructObject = false;
+
+		/* Whether the Blueprint-VM steppers (FFrame::Step/StepExplicitProperty + GNatives) were located */
+		inline bool bHasScriptVM = false;
+
+		/* Whether the reflected-container edit helpers (FScriptMapHelper::FindOrAdd/RemoveAt) were located */
+		inline bool bHasScriptContainers = false;
 	}
 
 	extern void InitWeakObjectPtrSettings();

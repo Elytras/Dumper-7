@@ -180,12 +180,58 @@ static uintptr_t GetKismetExecAddress(const char* const FunctionName)
 /*
 * FName::FName(const wchar_t*, EFindName) — native string->FName ctor.
 *
-* Reached from the reflected exec UFunction 'Conv_StringToName' (100% findable by name). Inside that
-* stub the ctor is invoked with EFindName::FNAME_Add (== 1) as its 3rd argument, so we anchor on the
-* 'mov r8d, 1' immediate that precedes the call — semantically invariant, unlike picking by call
-* order (the stub also calls a GC/lock helper, FFrame::Step/StepExplicitProperty and FMemory::Free,
-* and which branch runs shifts the call indices). Decoupled from the FText finder.
+* Reached from the reflected exec UFunction 'Conv_StringToName' (100% findable by name). In its call
+* chain the ctor is invoked with EFindName::FNAME_Add (== 1) as its 3rd argument, so we anchor on the
+* 'mov r8d, 1' immediate that precedes the call — semantically invariant, unlike picking by call order
+* (the chain also touches a GC/lock helper, FFrame::Step/StepExplicitProperty and FMemory::Free, and
+* which branch runs shifts the call indices).
+*
+* The immediate sits in different functions across engine versions: UE5 / RogueCore inlines the
+* reflected wrapper into the exec stub (immediate in the stub itself), while UE4.27 / Deep Rock keeps a
+* separate reflected 'Conv_StringToName' that the stub calls (immediate one level down). So we walk the
+* call-subtree from the stub (depth-bounded, each body bounded by FindFunctionEnd so a scan can't bleed
+* into an adjacent function) instead of scanning only the stub. Decoupled from the FText finder.
 */
+static uintptr_t FindFNameCtorViaImmediate(uintptr_t Fn)
+{
+	if (!Platform::IsAddressInProcessRange(Fn))
+		return 0x0;
+
+	const uintptr_t End = Architecture_x86_64::FindFunctionEnd(Fn, 0x400);
+	const uintptr_t Range = (End > Fn && (End - Fn) <= 0x400) ? (End - Fn) : 0x150;
+
+	// 41 B8 01 00 00 00 = mov r8d, 1 (EFindName::FNAME_Add). The compiler may hoist it ~0x1C above the
+	// call (setnz/add/cmp/mov/cmovnz in between), so DON'T require adjacency — anchor on the immediate,
+	// then resolve the first 'call rel32' that follows it.
+	void* const Hit = Platform::FindPatternInRange("41 B8 01 00 00 00", Fn, Range);
+	if (!Hit)
+		return 0x0;
+
+	const uintptr_t Ctor = Architecture_x86_64::GetRipRelativeCalledFunction(reinterpret_cast<uintptr_t>(Hit), 1, nullptr);
+	return Platform::IsAddressInProcessRange(Ctor) ? Ctor : 0x0;
+}
+
+static uintptr_t FindFNameCtorWcharRec(uintptr_t Fn, int32 Depth)
+{
+	if (const uintptr_t Ctor = FindFNameCtorViaImmediate(Fn))
+		return Ctor;
+
+	if (Depth <= 0)
+		return 0x0;
+
+	for (int32 k = 1; k <= 8; ++k)
+	{
+		const uintptr_t Child = Architecture_x86_64::GetRipRelativeCalledFunction(Fn, k, nullptr);
+		if (!Child || Child == Fn)
+			continue;
+
+		if (const uintptr_t Found = FindFNameCtorWcharRec(Child, Depth - 1))
+			return Found;
+	}
+
+	return 0x0;
+}
+
 void Off::InSDK::Name::InitFNameCtorWchar()
 {
 #ifdef PLATFORM_WINDOWS
@@ -197,20 +243,11 @@ void Off::InSDK::Name::InitFNameCtorWchar()
 		return;
 	}
 
-	// 41 B8 01 00 00 00 = mov r8d, 1 (EFindName::FNAME_Add). The compiler hoists this above the call
-	// (observed ~0x1C bytes earlier, with setnz/add/cmp/mov/cmovnz in between), so DON'T require it to
-	// be adjacent to the E8 — anchor on the immediate, then resolve the first 'call rel32' that follows.
-	void* const Hit = Platform::FindPatternInRange("41 B8 01 00 00 00", NameExec, 0x150);
-	if (!Hit)
+	// Depth 2: exec stub (UE5/RC, immediate inlined) -> reflected Conv_StringToName (UE4.27/DRG) -> ctor.
+	const uintptr_t Ctor = FindFNameCtorWcharRec(NameExec, 2);
+	if (!Ctor)
 	{
-		std::cerr << "FName ctor: EFindName immediate not found, override manually.\n";
-		return;
-	}
-
-	const uintptr_t Ctor = Architecture_x86_64::GetRipRelativeCalledFunction(reinterpret_cast<uintptr_t>(Hit), 1, nullptr);
-	if (!Platform::IsAddressInProcessRange(Ctor))
-	{
-		std::cerr << "FName ctor: resolved call target out of range, override manually.\n";
+		std::cerr << "FName ctor: EFindName immediate not found in exec stub or its callees, override manually.\n";
 		return;
 	}
 
@@ -503,6 +540,123 @@ void Off::InSDK::Construct::InitStaticConstructObjectInternal()
 	std::cerr << std::format(
 		"StaticConstructObject_Internal (family {}): 0x{:X}\n",
 		matchedFamily, Off::InSDK::Construct::StaticConstructObjectInternalOffset);
+#endif
+#endif
+}
+
+/*
+* Off::InSDK::ScriptVM::InitScriptVM
+*
+* Blueprint-VM steppers. FFrame::Step is the inner interpreter loop: it reads *Code++ (Code @ FFrame+0x20)
+* and tail-dispatches GNatives[op]. Its prologue is byte-identical on UE 4.27 (DRG) and UE 5.6 (RC) — the
+* only build variance is the rip-relative displacement of the `lea r9, [rip+GNatives]`, which we wildcard,
+* so a single signature covers both engine generations. GNatives (the EX-opcode -> handler dispatch table,
+* the backbone of the VM) is then decoded deterministically from that lea. StepExplicitProperty does
+* `bt PropertyFlags, 8` (CPF_OutParm); its only version delta is the FProperty PropertyFlags byte offset
+* (r8+0x38 on UE5.6, r8+0x40 on UE4.27), which we mask. All addresses logged; manual override available.
+*/
+void Off::InSDK::ScriptVM::InitScriptVM()
+{
+#ifdef PLATFORM_WINDOWS
+#if defined(_WIN64)
+	// mov rax,[rcx+20]; mov r10,rdx; mov rdx,rcx; movzx ecx,[rax]; inc rax; mov [rcx+20],rax;
+	// mov eax,r9d; lea r9,[rip+GNatives]; mov rcx,r10; jmp qword [r9+rax*8]
+	const char* stepSig =
+		"48 8B 41 20 4C 8B D2 48 8B D1 44 0F B6 08 48 FF C0 48 89 41 20 "
+		"41 8B C1 4C 8D 0D ?? ?? ?? ?? 49 8B CA 49 FF 24 C1";
+	void* const step = Platform::FindPattern(stepSig, 0x0, false, 0x0, nullptr);
+	if (!step)
+	{
+		std::cerr << "ScriptVM: FFrame::Step pattern not matched, skipping (override manually).\n";
+		return;
+	}
+
+	const uint64 base = Platform::GetModuleBase();
+	Off::InSDK::ScriptVM::FFrameStepOffset =
+		static_cast<int32>(reinterpret_cast<uint8_t*>(step) - reinterpret_cast<uint8_t*>(base));
+
+	// GNatives: the first `4C 8D 0D <disp32>` (lea r9,[rip+disp32]) inside Step. lea is 7 bytes, rip points
+	// at the following instruction, so target = &lea + 7 + disp32.
+	void* const lea = Platform::FindPatternInRange("4C 8D 0D", reinterpret_cast<uintptr_t>(step), 0x40);
+	if (lea)
+	{
+		const uint8_t* const p = reinterpret_cast<const uint8_t*>(lea);
+		const int32 disp = *reinterpret_cast<const int32*>(p + 3);
+		const uintptr_t gnatives = reinterpret_cast<uintptr_t>(p) + 7 + disp;
+		if (Platform::IsAddressInProcessRange(gnatives))
+			Off::InSDK::ScriptVM::GNativesOffset = static_cast<int32>(gnatives - base);
+	}
+
+	// FFrame::StepExplicitProperty: `mov eax,[r8+PropertyFlags]; ...; bt rax,8; jae ...` — mask the
+	// PropertyFlags byte (0x38 UE5.6 / 0x40 UE4.27). `48 0F BA E0 08` (bt rax,8) makes it distinctive.
+	const char* stepExplicitSig = "41 8B 40 ?? 4D 8B C8 4C 8B D1 48 0F BA E0 08 73";
+	void* const stepExplicit = Platform::FindPattern(stepExplicitSig, 0x0, false, 0x0, nullptr);
+	if (stepExplicit)
+		Off::InSDK::ScriptVM::FFrameStepExplicitPropertyOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(stepExplicit) - reinterpret_cast<uint8_t*>(base));
+
+	Settings::Internal::bHasScriptVM = true;
+	std::cerr << std::format(
+		"ScriptVM: FFrame::Step 0x{:X} | StepExplicitProperty 0x{:X} | GNatives 0x{:X}\n",
+		Off::InSDK::ScriptVM::FFrameStepOffset,
+		Off::InSDK::ScriptVM::FFrameStepExplicitPropertyOffset,
+		Off::InSDK::ScriptVM::GNativesOffset);
+#endif
+#endif
+}
+
+/*
+* Off::InSDK::ScriptContainers::InitScriptContainers
+*
+* Reflected-container (TMap) edit helpers. FScriptMapHelper::FindOrAdd / RemoveAt operate on a stack
+* FScriptMapHelper {KeyProp, ValueProp, Map, MapLayout, MapFlags}; their UE5.6 prologue unpacks that
+* helper inline (movzx eax,[rcx+0x30]=MapFlags; lea/mov of MapLayout@+0x18, KeyProp@+0, ValueProp@+8,
+* Map@+0x10), which is a distinctive, stable fingerprint. The function frame-size immediate is wildcarded.
+* Independent of InitScriptVM (a Step-pattern miss must not block these). UE4.27 lacks the MapFlags field,
+* so this is a UE5-shaped scan; it simply leaves the offsets at 0 on engines where it doesn't match.
+*/
+void Off::InSDK::ScriptContainers::InitScriptContainers()
+{
+#ifdef PLATFORM_WINDOWS
+#if defined(_WIN64)
+	const uint64 base = Platform::GetModuleBase();
+
+	// FScriptMapHelper::FindOrAdd(this in rcx, KeyPtr in rdx) -> pair index.
+	const char* findOrAddSig =
+		"40 55 53 57 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 0F B6 41 30 48 8D 79 18 "
+		"4C 8B 01 F6 D0 4C 8B 49 08 48 8B 59 10 A8 01";
+	void* const findOrAdd = Platform::FindPattern(findOrAddSig, 0x0, false, 0x0, nullptr);
+	if (findOrAdd)
+		Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(findOrAdd) - reinterpret_cast<uint8_t*>(base));
+
+	// FScriptMapHelper::RemoveAt(this in rcx, Index in edx).
+	const char* removeAtSig =
+		"48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 41 56 48 83 EC ?? "
+		"0F B6 41 30 41 8B E8 48 8B 71 10 F6 D0";
+	void* const removeAt = Platform::FindPattern(removeAtSig, 0x0, false, 0x0, nullptr);
+	if (removeAt)
+		Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(removeAt) - reinterpret_cast<uint8_t*>(base));
+
+	// FScriptMapHelper::FindMapPairIndexFromHash(this in rcx, KeyPtr in rdx) -> int32 pair index.
+	const char* findPairSig =
+		"4C 8B DC 48 83 EC ?? 0F B6 41 30 4C 8D 41 18 4C 8B 09 F6 D0 4C 8B 51 10 A8 01 "
+		"49 8D 43 08 4D 89 4B 08 4D 89 4B 10";
+	void* const findPair = Platform::FindPattern(findPairSig, 0x0, false, 0x0, nullptr);
+	if (findPair)
+		Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(findPair) - reinterpret_cast<uint8_t*>(base));
+
+	if (findOrAdd || removeAt || findPair)
+	{
+		Settings::Internal::bHasScriptContainers = true;
+		std::cerr << std::format(
+			"ScriptContainers: FScriptMapHelper::FindOrAdd 0x{:X} | RemoveAt 0x{:X} | FindPairIndex 0x{:X}\n",
+			Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset,
+			Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset,
+			Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset);
+	}
 #endif
 #endif
 }

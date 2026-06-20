@@ -3939,6 +3939,24 @@ using namespace UC;
 			"\n\tconstexpr int32 StaticConstructObjectInternal = 0x{:08X};",
 			max(Off::InSDK::Construct::StaticConstructObjectInternalOffset, 0x0));
 
+	if (Settings::Internal::bHasScriptVM)
+		AuxFunctionOffsetsText += std::format(
+			"\n\tconstexpr int32 FFrameStep                  = 0x{:08X};"
+			"\n\tconstexpr int32 FFrameStepExplicitProperty  = 0x{:08X};"
+			"\n\tconstexpr int32 GNatives                    = 0x{:08X};",
+			max(Off::InSDK::ScriptVM::FFrameStepOffset, 0x0),
+			max(Off::InSDK::ScriptVM::FFrameStepExplicitPropertyOffset, 0x0),
+			max(Off::InSDK::ScriptVM::GNativesOffset, 0x0));
+
+	if (Settings::Internal::bHasScriptContainers)
+		AuxFunctionOffsetsText += std::format(
+			"\n\tconstexpr int32 FScriptMapHelperFindOrAdd      = 0x{:08X};"
+			"\n\tconstexpr int32 FScriptMapHelperRemoveAt       = 0x{:08X};"
+			"\n\tconstexpr int32 FScriptMapHelperFindPairIndex  = 0x{:08X};",
+			max(Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset, 0x0),
+			max(Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset, 0x0),
+			max(Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset, 0x0));
+
 	/* Offsets and disclaimer */
 	BasicHpp << std::format(R"(
 /*
@@ -4360,6 +4378,15 @@ class FFieldVariant;
 
 	BasicHpp << R"(
 class FName;
+
+// UE's EFindName. FNAME_Find looks up an existing name entry WITHOUT interning it (returns
+// None when the string was never registered); FNAME_Add interns it. Values mirror the engine
+// enum, and are passed straight through as the native FName ctor's 3rd argument.
+enum class EFindName : uint32
+{
+	FNAME_Find = 0,
+	FNAME_Add  = 1,
+};
 )";
 
 	BasicHpp << R"(
@@ -4379,7 +4406,7 @@ namespace BasicFilesImpleUtils
 
 	UFunction* FindFunctionByFName(const FName* Name);
 
-	FName StringToName(const wchar_t* Name);
+	FName StringToName(const wchar_t* Name, EFindName FindType = EFindName::FNAME_Add);
 }
 )";
 
@@ -4434,17 +4461,20 @@ UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 	/* StringToName: native FName(const wchar_t*, EFindName::FNAME_Add) when the OffsetFinder located
 	   the ctor, otherwise the reflected UKismetStringLibrary::Conv_StringToName fallback. */
 	BasicCpp << (Settings::Internal::bHasFNameCtorWchar ? R"(
-FName BasicFilesImpleUtils::StringToName(const wchar_t* Name)
+FName BasicFilesImpleUtils::StringToName(const wchar_t* Name, EFindName FindType)
 {
 	FName Out{};
 	InSDKUtils::CallGameFunction(
 		reinterpret_cast<void(*)(FName*, const wchar_t*, unsigned int)>(InSDKUtils::GetImageBase() + Offsets::FNameCtorWchar),
-		&Out, Name, 1u /* EFindName::FNAME_Add */);
+		&Out, Name, static_cast<unsigned int>(FindType));
 	return Out;
 }
 )" : R"(
-FName BasicFilesImpleUtils::StringToName(const wchar_t* Name)
+FName BasicFilesImpleUtils::StringToName(const wchar_t* Name, EFindName /* FindType */)
 {
+	// Reflected Conv_StringToName always interns (FNAME_Add) — EFindName::FNAME_Find cannot be
+	// honored on this fallback path. Resolve the native FName ctor (Offsets::FNameCtorWchar) to
+	// get true find-without-add behavior.
 	return UKismetStringLibrary::Conv_StringToName(FString(Name));
 }
 )");
@@ -5421,6 +5451,16 @@ Settings::Internal::bUseCasePreservingName ? ", DisplayIndex(DisplayIndex)" : ""
 			.NameWithParams = "FName(const wchar_t* Name)",
 			.Body = R"({
 	*this = BasicFilesImpleUtils::StringToName(Name);
+})"
+			,
+			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = true
+		},
+		PredefinedFunction {
+			.CustomComment = "Constructor from wide string with explicit find/add behavior (FNAME_Find = look up without interning)",
+			.ReturnType = "explicit",
+			.NameWithParams = "FName(const wchar_t* Name, EFindName FindType)",
+			.Body = R"({
+	*this = BasicFilesImpleUtils::StringToName(Name, FindType);
 })"
 			,
 			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = true

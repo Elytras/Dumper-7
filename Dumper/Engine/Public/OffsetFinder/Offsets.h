@@ -118,6 +118,32 @@ namespace Off
 			void InitStaticConstructObjectInternal();
 		}
 
+		namespace ScriptVM
+		{
+			// Blueprint-VM steppers. FFrame::Step has a signature byte-identical across UE 4.27 and
+			// UE 5.6 (only the GNatives lea-displacement varies), making it an exceptionally stable
+			// scan; GNatives (the EX-opcode->handler dispatch table) is decoded deterministically from
+			// the `lea r9, [rip+disp32]` inside FFrame::Step. StepExplicitProperty masks the
+			// CPF_OutParm byte offset (r8+0x38 UE5 / r8+0x40 UE4). All module-relative; 0 if not found.
+			inline int32 FFrameStepOffset = 0x0;                 // FFrame::Step
+			inline int32 FFrameStepExplicitPropertyOffset = 0x0; // FFrame::StepExplicitProperty
+			inline int32 GNativesOffset = 0x0;                   // GNatives (EX-opcode handler table)
+			void InitScriptVM();
+		}
+
+		namespace ScriptContainers
+		{
+			// Reflected-container edit helpers. FScriptMapHelper::FindOrAdd/RemoveAt let a consumer add/
+			// remove TMap pairs without reimplementing TSet::Add or GetTypeHash (the keyprop self-hashes).
+			// The prologue unpacks the helper inline (movzx eax,[rcx+0x30]=MapFlags; reads MapLayout@+0x18,
+			// KeyProp@+0, ValueProp@+8, Map@+0x10) — distinctive + stable; frame-size immediate masked.
+			// UE5.6-shaped (UE4.27 has no MapFlags field). All module-relative; 0 if not found.
+			inline int32 FScriptMapHelperFindOrAddOffset = 0x0;       // FScriptMapHelper::FindOrAdd
+			inline int32 FScriptMapHelperRemoveAtOffset = 0x0;        // FScriptMapHelper::RemoveAt
+			inline int32 FScriptMapHelperFindPairIndexOffset = 0x0;   // FScriptMapHelper::FindMapPairIndexFromHash
+			void InitScriptContainers();
+		}
+
 		namespace ULevel
 		{
 			inline int32 Actors;

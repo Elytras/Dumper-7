@@ -2829,6 +2829,51 @@ void CppGenerator::InitPredefinedFunctions()
 })";
 	}
 
+	/* UObject::NewObject<T>() - constructs a new UObject via the native StaticConstructObject_Internal when its offset
+	   was resolved (the direct-native path, no ProcessEvent), else a loud always-on abort. The FStaticConstructObjectParameters
+	   layout is engine-stable across the supported UE versions; static_asserts make any drift (e.g. a wider FName) a COMPILE
+	   error instead of silent stack corruption. Self-contained (only SDK types + Offsets::). */
+	std::string NewObjectBody;
+	if (Settings::Internal::bHasStaticConstructObject)
+	{
+		NewObjectBody = R"({
+	struct FConstructParams
+	{
+		const class UClass*   Class;
+		class UObject*        Outer;
+		class FName           Name;
+		EObjectFlags          SetFlags;
+		int32                 InternalSetFlags;
+		bool                  bCopyTransientsFromClassDefaults;
+		bool                  bAssumeTemplateIsArchetype;
+		class UObject*        Template;
+		void*                 InstanceGraph;
+		class UObject*        ExternalPackage;
+	};
+	static_assert(offsetof(FConstructParams, Name)     == 0x10, "NewObject: FStaticConstructObjectParameters layout drift (FName size?) - would corrupt the call. Regenerate / fix the layout.");
+	static_assert(offsetof(FConstructParams, SetFlags) == 0x18, "NewObject: FStaticConstructObjectParameters layout drift.");
+	static_assert(offsetof(FConstructParams, Template) == 0x28, "NewObject: FStaticConstructObjectParameters layout drift.");
+
+	FConstructParams Params{};
+	Params.Class = Class ? Class : UEType::StaticClass();
+	Params.Outer = Outer;
+	Params.Name  = Name;
+	Params.SetFlags = Flags;
+	Params.Template = Template;
+
+	const auto ConstructFn = reinterpret_cast<class UObject*(*)(void*)>(InSDKUtils::GetImageBase() + Offsets::StaticConstructObjectInternal);
+	return static_cast<UEType*>(ConstructFn(&Params));
+})";
+	}
+	else
+	{
+		NewObjectBody = R"({
+	(void)Outer; (void)Class; (void)Name; (void)Flags; (void)Template;
+	InSDKUtils::SdkUnavailable("UObject::NewObject<T>(): StaticConstructObject_Internal offset was not resolved for this build");
+	return nullptr;
+})";
+	}
+
 	UObjectPredefs.Functions =
 	{
 		/* static inline functions */
@@ -2897,6 +2942,14 @@ R"({
 R"({
 	return static_cast<UEType*>(FindObjectFastImpl(Name, RequiredType));
 })",
+			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
+		},
+		PredefinedFunction {
+			.CustomComment = "Constructs a new object via native StaticConstructObject_Internal (direct call, not ProcessEvent). Class defaults to UEType::StaticClass().",
+			.CustomTemplateText = "template<typename UEType = UObject>",
+			.ReturnType = "UEType*", .NameWithParams = "NewObject(class UObject* Outer = nullptr, class UClass* Class = nullptr, class FName Name = FName(), EObjectFlags Flags = static_cast<EObjectFlags>(0), class UObject* Template = nullptr)",
+			.NameWithParamsWithoutDefaults = "NewObject(class UObject* Outer, class UClass* Class, class FName Name, EObjectFlags Flags, class UObject* Template)",
+			.Body = NewObjectBody,
 			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
 		},
 		PredefinedFunction {

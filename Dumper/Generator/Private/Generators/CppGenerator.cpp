@@ -2792,6 +2792,43 @@ void CppGenerator::InitPredefinedFunctions()
 		: "\"Object\"";
 	const std::string UObjectStaticClassBody = std::format("{{\n\tSTATIC_CLASS_IMPL({})\n}}", UObjectStaticClassName);
 
+	/* UObject::IsValid() - strongest object-validity this build supports, chosen at generation time:
+	     1. registered-in-GObjects existence + identity (this->Index in range && GObjects[Index] == this) - the engine's
+	        own FUObjectArray::IsValid logic reimplemented in pure C++ over the SDK's own object array (no baked RVA,
+	        GC-flag-independent). Used whenever the UObject::Index offset was resolved (effectively always).
+	     2. best-effort 'this && Class' - the degraded default if only the Class offset is known.
+	     3. loud always-on abort - if neither was resolved.
+	   The signature is identical across all three, so full and stripped SDKs stay ABI-swappable and a genuinely
+	   unavailable op fails fast with a stack trace instead of silently returning wrong. */
+	std::string IsValidBody;
+	if (Off::UObject::Index > 0x0)
+	{
+		IsValidBody = R"({
+	if (!this)
+		return false;
+
+	if (!GObjects)
+		return false;
+
+	const int32 ObjIndex = this->Index;
+
+	return ObjIndex >= 0 && ObjIndex < GObjects->Num() && GObjects->GetByIndex(ObjIndex) == this;
+})";
+	}
+	else if (Off::UObject::Class > 0x0)
+	{
+		IsValidBody = R"({
+	return this && Class;
+})";
+	}
+	else
+	{
+		IsValidBody = R"({
+	InSDKUtils::SdkUnavailable("UObject::IsValid(): neither UObject::Index nor Class offset was resolved for this build");
+	return false;
+})";
+	}
+
 	UObjectPredefs.Functions =
 	{
 		/* static inline functions */
@@ -2953,6 +2990,11 @@ R"({
 		R"({
 	return (Flags & EObjectFlags::ClassDefaultObject);
 })",
+			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
+		},
+		PredefinedFunction{
+			.CustomComment = "Checks whether this object is still registered & alive in the global object array (existence + identity; GC-flag-independent)",
+			.ReturnType = "bool", .NameWithParams = "IsValid()", .Body = IsValidBody,
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},
 

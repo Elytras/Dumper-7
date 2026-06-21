@@ -249,6 +249,9 @@ namespace Off
 		inline int32 ChildProperties;
 		inline int32 Size;
 		inline int32 MinAlignment;
+		inline int32 Script;                        // TArray<uint8> bytecode (BP-VM disassembler); MinAlignment+4 if no scripted fn to verify
+		inline int32 StructBaseChainArray;          // FStructBaseChain** for O(1) IsChildOf; OffsetNotFound on pre-UE4.22
+		inline int32 NumStructBasesInChainMinusOne; // int32 sibling of StructBaseChainArray; only set when the chain was found
 	}
 
 	namespace UFunction

@@ -103,6 +103,8 @@ namespace OffsetFinder
 	int32_t FindChildPropertiesOffset();
 	int32_t FindStructSizeOffset();
 	int32_t FindMinAlignmentOffset();
+	int32_t FindScriptOffset();
+	int32_t FindStructBaseChainOffset();
 
 	/* UFunction */
 	int32_t FindFunctionFlagsOffset();

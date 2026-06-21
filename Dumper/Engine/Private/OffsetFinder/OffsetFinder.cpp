@@ -640,6 +640,93 @@ int32_t OffsetFinder::FindMinAlignmentOffset()
 	return FindOffset(Infos);
 }
 
+int32_t OffsetFinder::FindScriptOffset()
+{
+	/* UStruct::Script (TArray<uint8> Blueprint bytecode) sits immediately after MinAlignment (int32) across
+	   UE4.15-5.x. Derive from the binary-found MinAlignment anchor, then VERIFY the TArray shape against a real
+	   scripted UFunction that actually carries bytecode (Data readable, 0 < Num <= Max). Dumper-7 did not emit
+	   this before; the BP-VM disassembler needs it. */
+	const int32 Candidate = Off::UStruct::MinAlignment + static_cast<int32>(sizeof(int32));
+
+	const int32 NumObjects = ObjectArray::Num();
+	for (int32 i = 0; i < NumObjects; i++)
+	{
+		UEObject Obj = ObjectArray::GetByIndex(i);
+
+		if (Obj.GetAddress() == nullptr || !Obj.IsA(EClassCastFlags::Function))
+			continue;
+
+		const uint8* const Addr = static_cast<const uint8*>(Obj.GetAddress());
+		const void* const ScriptData = *reinterpret_cast<void* const*>(Addr + Candidate);
+		const int32 ScriptNum = *reinterpret_cast<const int32*>(Addr + Candidate + 0x08);
+		const int32 ScriptMax = *reinterpret_cast<const int32*>(Addr + Candidate + 0x0C);
+
+		if (ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData))
+			return Candidate; // verified against a real bytecode array
+	}
+
+	return Candidate; // no scripted function found to verify against -> fall back to the anchor-derived offset
+}
+
+int32_t OffsetFinder::FindStructBaseChainOffset()
+{
+	/* UStruct embeds FStructBaseChain { FStructBaseChain** StructBaseChainArray; int32 NumStructBasesInChainMinusOne; }
+	   as its first own members (UE4.22+). Defining invariant: StructBaseChainArray[NumStructBasesInChainMinusOne]
+	   points back to this struct's own FStructBaseChain subobject (== (uint8*)Struct + Offset). Scan the UStruct
+	   region for the (void**, int32) pair satisfying that self-at-chain-end invariant, validated across a few
+	   classes of differing inheritance depth. Powers an O(1) IsChildOf; absent on pre-UE4.22 -> OffsetNotFound. */
+	void* const Structs[] = {
+		ObjectArray::FindObjectFast("Object").GetAddress(),  // depth 0 (no super)
+		ObjectArray::FindObjectFast("Field").GetAddress(),   // depth 1 (Object)
+		ObjectArray::FindObjectFast("Struct").GetAddress(),  // depth 2 (Object, Field)
+	};
+
+	auto SatisfiesInvariant = [](void* StructPtr, int32 Offset) -> bool
+	{
+		if (StructPtr == nullptr)
+			return false;
+
+		uint8* const Base = static_cast<uint8*>(StructPtr);
+		void** const Array = *reinterpret_cast<void** const*>(Base + Offset);
+		const int32 NumMinusOne = *reinterpret_cast<const int32*>(Base + Offset + sizeof(void*));
+
+		if (Platform::IsBadReadPtr(Array) || NumMinusOne < 0 || NumMinusOne > 0x40)
+			return false;
+
+		if (Platform::IsBadReadPtr(reinterpret_cast<void*>(Array + NumMinusOne)))
+			return false;
+
+		// the chain ends with this struct's own FStructBaseChain subobject (== Base + Offset)
+		return Array[NumMinusOne] == reinterpret_cast<void*>(Base + Offset);
+	};
+
+	const int32 MaxOffset = Off::UStruct::SuperStruct != 0x0 ? Off::UStruct::SuperStruct : 0x50;
+
+	for (int32 Offset = OffsetFinderMinValue; Offset < MaxOffset; Offset += sizeof(void*))
+	{
+		bool bAllValid = true;
+		int32 NumChecked = 0;
+
+		for (void* StructPtr : Structs)
+		{
+			if (StructPtr == nullptr)
+				continue;
+
+			++NumChecked;
+			if (!SatisfiesInvariant(StructPtr, Offset))
+			{
+				bAllValid = false;
+				break;
+			}
+		}
+
+		if (bAllValid && NumChecked > 0)
+			return Offset;
+	}
+
+	return OffsetNotFound;
+}
+
 /* UFunction */
 int32_t OffsetFinder::FindFunctionFlagsOffset()
 {

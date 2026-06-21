@@ -887,6 +887,17 @@ void Off::Init()
 
 	// Castflags become available for use
 
+	// UStruct::Script (BP bytecode) + StructBaseChain (O(1) IsChildOf) - derived from binary, not emitted by older Dumper-7.
+	// Script needs MinAlignment (+ CastFlags for the IsA(Function) verify); StructBaseChain needs SuperStruct - all set above.
+	Off::UStruct::Script = OffsetFinder::FindScriptOffset();
+	std::cerr << std::format("Off::UStruct::Script: 0x{:X}\n", Off::UStruct::Script);
+
+	Off::UStruct::StructBaseChainArray = OffsetFinder::FindStructBaseChainOffset();
+	if (Off::UStruct::StructBaseChainArray != OffsetFinder::OffsetNotFound)
+		Off::UStruct::NumStructBasesInChainMinusOne = Off::UStruct::StructBaseChainArray + sizeof(void*);
+	std::cerr << std::format("Off::UStruct::StructBaseChainArray: 0x{:X} (NumStructBasesInChainMinusOne @ 0x{:X})\n",
+		Off::UStruct::StructBaseChainArray, Off::UStruct::NumStructBasesInChainMinusOne);
+
 	if (Settings::Internal::bUseFProperty)
 	{
 		std::cerr << std::format("\nGame uses FProperty system\n\n");

@@ -2973,12 +2973,35 @@ R"({{
 
 	PredefinedElements& UStructPredefs = PredefinedMembers[UStructIdx];
 
-	UStructPredefs.Functions =
+	/* Pick the strongest IsSubclassOf(const UStruct*) this build supports, decided at generation time:
+	     1. O(1) FStructBaseChain  - when the chain offsets were resolved (UE4.22+). Offsets baked as literals so
+	        the emitted SDK stays self-contained (no Offsets:: / external dependency).
+	     2. O(n) SuperStruct walk  - the always-available default whenever SuperStruct was resolved.
+	     3. loud abort             - if neither was resolved: the symbol is still emitted (dependent code compiles
+	        against any SDK variant), but a call fails fast with a stack trace rather than silently returning wrong.
+	   The public signature is identical across all three, so a fully-featured SDK and a stripped one are ABI-swappable. */
+	std::string IsSubclassOfByPtrBody;
+	if (Off::UStruct::StructBaseChainArray > 0x0 && Off::UStruct::NumStructBasesInChainMinusOne > 0x0)
 	{
-		PredefinedFunction {
-			.CustomComment = "Checks if this class has a certain base",
-			.ReturnType = "bool", .NameWithParams = "IsSubclassOf(const UStruct* Base)", .Body =
-R"({
+		IsSubclassOfByPtrBody = std::format(R"({{
+	if (!Base)
+		return false;
+
+	const uint8* const ThisBytes = reinterpret_cast<const uint8*>(this);
+	const uint8* const BaseBytes = reinterpret_cast<const uint8*>(Base);
+
+	const int32 BaseNumInChain = *reinterpret_cast<const int32*>(BaseBytes + 0x{0:X});
+	const int32 ThisNumInChain = *reinterpret_cast<const int32*>(ThisBytes + 0x{0:X});
+	const void* const* const ThisChain = *reinterpret_cast<const void* const* const*>(ThisBytes + 0x{1:X});
+
+	// 'this' derives from 'Base' iff Base sits at-or-before 'this' in the chain and the chain entry at Base's depth
+	// is Base's own FStructBaseChain node (which lives at Base + StructBaseChainArray offset).
+	return BaseNumInChain <= ThisNumInChain && ThisChain[BaseNumInChain] == reinterpret_cast<const void*>(BaseBytes + 0x{1:X});
+}})", Off::UStruct::NumStructBasesInChainMinusOne, Off::UStruct::StructBaseChainArray);
+	}
+	else if (Off::UStruct::SuperStruct > 0x0)
+	{
+		IsSubclassOfByPtrBody = R"({
 	if (!Base)
 		return false;
 
@@ -2989,13 +3012,21 @@ R"({
 	}
 
 	return false;
-})",
-			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
-		},
-		PredefinedFunction {
-			.CustomComment = "Checks if this class has a certain base",
-			.ReturnType = "bool", .NameWithParams = "IsSubclassOf(const FName& BaseClassName)", .Body =
-R"({
+})";
+	}
+	else
+	{
+		IsSubclassOfByPtrBody = R"({
+	(void)Base;
+	InSDKUtils::SdkUnavailable("UStruct::IsSubclassOf(const UStruct*): neither StructBaseChain nor SuperStruct offset was resolved for this build");
+	return false;
+})";
+	}
+
+	std::string IsSubclassOfByNameBody;
+	if (Off::UStruct::SuperStruct > 0x0)
+	{
+		IsSubclassOfByNameBody = R"({
 	if (BaseClassName.IsNone())
 		return false;
 
@@ -3006,7 +3037,27 @@ R"({
 	}
 
 	return false;
-})",
+})";
+	}
+	else
+	{
+		IsSubclassOfByNameBody = R"({
+	(void)BaseClassName;
+	InSDKUtils::SdkUnavailable("UStruct::IsSubclassOf(const FName&): no SuperStruct offset was resolved for this build");
+	return false;
+})";
+	}
+
+	UStructPredefs.Functions =
+	{
+		PredefinedFunction {
+			.CustomComment = "Checks if this class has a certain base (O(1) FStructBaseChain when available, else SuperStruct walk)",
+			.ReturnType = "bool", .NameWithParams = "IsSubclassOf(const UStruct* Base)", .Body = IsSubclassOfByPtrBody,
+			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
+		},
+		PredefinedFunction {
+			.CustomComment = "Checks if this class has a certain base",
+			.ReturnType = "bool", .NameWithParams = "IsSubclassOf(const FName& BaseClassName)", .Body = IsSubclassOfByNameBody,
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},
 	};
@@ -3880,6 +3931,8 @@ void CppGenerator::GenerateBasicFiles(StreamType& BasicHpp, StreamType& BasicCpp
 #endif
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <iterator>
 #include <string>
@@ -4126,6 +4179,20 @@ namespace InSDKUtils
 
 	/* Custom 'GetImageBase' function */
 	BasicHpp << "\tuintptr_t GetImageBase();\n\n";
+
+
+	/* Always-on fatal for operations the dumper could not generate for this build. Unlike assert (stripped under
+	   NDEBUG), this always fires: the symbol stays present so dependent code still compiles against a stripped-down
+	   SDK, but a call crashes loudly with a message + a debuggable stack trace instead of silently returning a wrong
+	   result. Self-contained (only <cstdio>/<cstdlib>); no dependency on any external/mod headers. */
+	BasicHpp << R"(	[[noreturn]] inline void SdkUnavailable(const char* What)
+	{
+		std::fprintf(stderr, "\n[SDK FATAL] operation unavailable on this build: %s\n", What);
+		std::fflush(stderr);
+		std::abort();
+	}
+
+)";
 
 
 	/* GetVirtualFunction(const void* ObjectInstance, int32 Index) function */

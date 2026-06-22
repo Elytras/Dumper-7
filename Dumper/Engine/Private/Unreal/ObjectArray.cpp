@@ -275,6 +275,16 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 				return *reinterpret_cast<void**>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
 			};
 
+			ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+			{
+				if (Index < 0 || Index > Num())
+					return nullptr;
+
+				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+
+				return reinterpret_cast<void*>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
+			};
+
 			uint8_t* FirstItem = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
 			ObjectArray::InitializeFUObjectItem(FirstItem);
@@ -308,7 +318,23 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 				return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
 			};
-			
+
+			ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+			{
+				if (Index < 0 || Index > Num())
+					return nullptr;
+
+				const int32 ChunkIndex = Index / PerChunk;
+				const int32 InChunkIdx = Index % PerChunk;
+
+				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+
+				uint8_t* Chunk = reinterpret_cast<uint8_t**>(ChunkPtr)[ChunkIndex];
+				uint8_t* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize);
+
+				return reinterpret_cast<void*>(ItemPtr + FUObjectItemOffset);
+			};
+
 			uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
 			ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
@@ -351,6 +377,16 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
 	};
 
+	ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+	{
+		if (Index < 0 || Index > Num())
+			return nullptr;
+
+		uint8_t* ItemPtr = *reinterpret_cast<uint8_t**>(ObjectsArray) + (Index * FUObjectItemSize);
+
+		return reinterpret_cast<void*>(ItemPtr + FUObjectItemOffset);
+	};
+
 	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
 	std::cerr << "Overwrote FFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
@@ -383,11 +419,77 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
 	};
 
+	ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+	{
+		if (Index < 0 || Index > Num())
+			return nullptr;
+
+		const int32 ChunkIndex = Index / PerChunk;
+		const int32 InChunkIdx = Index % PerChunk;
+
+		uint8_t* Chunk = (*reinterpret_cast<uint8_t***>(ObjectsArray))[ChunkIndex];
+		uint8_t* ItemPtr = reinterpret_cast<uint8_t*>(Chunk) + (InChunkIdx * FUObjectItemSize);
+
+		return reinterpret_cast<void*>(ItemPtr + FUObjectItemOffset);
+	};
+
 	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
 	std::cerr << "Overwrote FChunkedFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
 
 	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+}
+
+/* Shared worker: OR RootSet onto items in [Begin, End). EInternalObjectFlags::RootSet is engine-canonical
+   (1<<30), stable across UE4.27..UE5; FUObjectItem.Flags lives 8 bytes after the Object pointer
+   (FUObjectItem { UObjectBase* Object; int32 Flags; ... }). Returns the count flagged. */
+int32 ObjectArray::KeepRangeFromGC(int32 Begin, int32 End)
+{
+	if (!ItemAddrByIndex || Begin >= End)
+		return 0;
+
+	constexpr uint32 RootSet = 0x40000000;
+
+	void* const ObjectsArray = GObjects + Off::FUObjectArray::GetObjectsOffset();
+	int32 Flagged = 0;
+
+	for (int32 i = Begin; i < End; ++i)
+	{
+		void* const ItemSlot = ItemAddrByIndex(ObjectsArray, i, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk);
+		if (!ItemSlot)
+			continue;
+
+		void* const Object = *reinterpret_cast<void**>(ItemSlot);
+		if (!Object)
+			continue;
+
+		uint32* const Flags = reinterpret_cast<uint32*>(reinterpret_cast<uint8_t*>(ItemSlot) + sizeof(void*));
+		*Flags |= RootSet;
+		++Flagged;
+	}
+
+	return Flagged;
+}
+
+int32 ObjectArray::KeepAllFromGC()
+{
+	return KeepRangeFromGC(0, Num());
+}
+
+int32 ObjectArray::KeepNewFromGC(int32 MaxBatch)
+{
+	/* Forward-only cursor: rooted objects are immortal (RootSet stops GC), so their slots never free or
+	   relocate - we never need to re-visit marked indices, only march over freshly spawned ones. */
+	static int32 Cursor = 0;
+
+	const int32 N = Num();
+	if (Cursor >= N)
+		return 0; // caught up; nothing new this tick
+
+	const int32 End = (MaxBatch > 0) ? min(Cursor + MaxBatch, N) : N;
+	const int32 Flagged = KeepRangeFromGC(Cursor, End);
+	Cursor = End;
+	return Flagged;
 }
 
 void ObjectArray::DumpObjects(const fs::path& Path, bool bWithPathname)

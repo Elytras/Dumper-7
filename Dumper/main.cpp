@@ -113,6 +113,15 @@ static void RunFullDump()
 {
 	Generator::InitInternal();
 
+	/* Opt-in: pin every live object with RootSet so GC keeps them -> fuller dumps. Runs here (game thread
+	   parked inside the Tick hook) so GObjects is stable while we OR the flags. "Cursed": the game won't GC
+	   these again afterwards. */
+	if (Settings::Config::bKeepObjectsAliveForDump)
+	{
+		const int32 Flagged = ObjectArray::KeepAllFromGC();
+		std::cerr << std::format("[Dumper-7] KeepObjectsAlive: flagged {} live objects RootSet (GC-keep).\n", Flagged);
+	}
+
 	if (Settings::Generator::GameName.empty() && Settings::Generator::GameVersion.empty())
 	{
 		FString Name;
@@ -173,6 +182,36 @@ static void RestoreTickHook()
 
 static void TickHook(void* This, float DeltaSeconds, bool bIdleMode)
 {
+	/* KeepObjectsAlive mode: don't dump on tick. Instead keep re-rooting every object (throttled) on the
+	   game thread so newly-loaded assets/levels survive GC while the user roams, and only fall through to
+	   the dump once the dump hotkey is pressed. The hook stays installed (one frame is never "parked") until
+	   then. */
+	if (Settings::Config::bKeepObjectsAliveForDump)
+	{
+		/* First tick: root EVERY existing object in one full sweep, so nothing the eventual dump will touch
+		   (e.g. an enum used as a function param) can be GC'd during the wait. Deferring the full sweep to
+		   dump time is too late - an object freed mid-wait is already gone and can't be resurrected. This is
+		   the game thread, so GObjects is stable for the sweep. */
+		static bool bRootedAll = false;
+		if (!bRootedAll)
+		{
+			const int32 Flagged = ObjectArray::KeepAllFromGC();
+			std::cerr << std::format("[Dumper-7] KeepObjectsAlive: rooted {} existing objects (full sweep); now keeping new ones each tick.\n", Flagged);
+			bRootedAll = true;
+		}
+		else
+		{
+			/* Incremental forward root: cap work at KeepBatchPerTick items/tick (cheap), marching a
+			   persistent cursor over freshly spawned objects. Already-rooted objects are immortal so their
+			   slots never move/free - we only mark new ones. */
+			constexpr int32 KeepBatchPerTick = 10000;
+			ObjectArray::KeepNewFromGC(KeepBatchPerTick);
+		}
+
+		if (!(GetAsyncKeyState(Settings::Config::DumpHotkey) & 0x8000))
+			return g_OriginalTick(This, DeltaSeconds, bIdleMode); // dump not triggered yet - keep looping
+	}
+
 	/* Only the first invocation runs the dump; any other call (watchdog already claimed, or a second
 	   engine instance ticking) passes straight through to the real Tick. Pass-through never touches
 	   g_PatchedSlots, so it can't race the watchdog's RestoreTickHook(). */
@@ -220,6 +259,43 @@ static bool InstallTickHook()
 	g_OriginalTick = reinterpret_cast<TickFnType>(Platform::GetModuleBase() + Off::InSDK::Engine::UGameEngineTickOffset);
 
 	const UEObject CDO = EngineClass.GetDefaultObject();
+
+	/* The Tick INDEX comes from a size-heuristic and can be wrong; the Tick RVA (UGameEngineTickOffset) is
+	   reliable (it's what mod-side hooks validate against). So treat the RVA as the source of truth: scan the
+	   GameEngine CDO's vtable for the slot that actually holds it and hook THAT, instead of blindly trusting
+	   the heuristic index. Falls back to the heuristic index if the scan finds nothing (e.g. the CDO already
+	   carries a per-class override whose address != the base Tick). */
+	if (CDO)
+	{
+		void** const CdoVtbl = *reinterpret_cast<void** const*>(CDO.GetAddress());
+		if (CdoVtbl && !Platform::IsBadReadPtr(CdoVtbl))
+		{
+			constexpr int32 MaxVtableSlots = 0x300;
+			int32 FoundIdx = -1;
+			for (int32 i = 0; i < MaxVtableSlots; ++i)
+			{
+				void* const Fn = CdoVtbl[i];
+				if (!Fn || Platform::IsBadReadPtr(Fn))
+					break; // past the end of this vtable
+				if (reinterpret_cast<uintptr_t>(Fn) == reinterpret_cast<uintptr_t>(g_OriginalTick))
+				{
+					FoundIdx = i;
+					break;
+				}
+			}
+
+			if (FoundIdx >= 0 && FoundIdx != g_TickIdx)
+			{
+				std::cerr << std::format("[Dumper-7] Tick slot heuristic index {} disagrees with the resolved RVA - using scanned slot[{}] instead.\n",
+					g_TickIdx, FoundIdx);
+				g_TickIdx = FoundIdx;
+			}
+			else if (FoundIdx < 0)
+			{
+				std::cerr << std::format("[Dumper-7] Resolved Tick RVA not found in the GameEngine CDO vtable - trusting heuristic slot[{}] (may carry a per-class override).\n", g_TickIdx);
+			}
+		}
+	}
 
 	std::vector<void**> SeenVtables;
 	int32 NumInstances = 0;
@@ -288,6 +364,10 @@ DWORD MainThread(HMODULE Module)
 
 	Settings::Config::Load();
 
+	if (Settings::Config::bCoexistWithMod)
+		std::cerr << "[Dumper-7] CoexistWithMod ON: running alongside the mod DLL (mod hooks Tick by RVA); "
+		             "off-thread dump fallback disabled.\n";
+
 	if (Settings::Config::SleepTimeout > 0)
 	{
 		std::cerr << "Sleeping for " << Settings::Config::SleepTimeout << "ms...\n";
@@ -305,23 +385,43 @@ DWORD MainThread(HMODULE Module)
 
 	if (InstallTickHook())
 	{
-		std::cerr << "[Dumper-7] Waiting for the game thread to pick up the dump...\n";
-
-		/* Wait for the first tick to claim the dump. If the engine doesn't tick within the grace
-		   period, fall back to an off-thread dump (race-safe via g_DumpClaimed). */
-		constexpr DWORD FirstTickGraceMs = 20000;
-		if (WaitForSingleObject(g_DumpStartedEvent, FirstTickGraceMs) == WAIT_TIMEOUT
-			&& !g_DumpClaimed.exchange(true))
+		if (Settings::Config::bKeepObjectsAliveForDump)
 		{
-			std::cerr << std::dec << "[Dumper-7] Game thread did not tick within " << FirstTickGraceMs
-				<< "ms - restoring hook and dumping off-thread.\n";
-			RestoreTickHook();
-			RunFullDump();
+			/* KeepObjectsAlive: the hook re-roots every tick and waits for the user. No grace-timeout
+			   fallback (that would auto-dump and defeat the point) - block until the hotkey fires the dump. */
+			std::cerr << std::format("[Dumper-7] KeepObjectsAlive ON: re-rooting all objects on the game thread.\n"
+				"           Roam the game / load levels to pull objects in, then press hotkey 0x{:X} to dump.\n",
+				Settings::Config::DumpHotkey);
+			WaitForSingleObject(g_DumpDoneEvent, INFINITE);
+		}
+		else if (Settings::Config::bCoexistWithMod)
+		{
+			/* Coexist mode: the mod also hooks Tick, so the engine is proven to tick - never fall back to an
+			   off-thread dump (it would race GC while the mod keeps the game live). Block until the game
+			   thread claims and finishes the dump. */
+			std::cerr << "[Dumper-7] Waiting for the game thread to pick up the dump (coexist: no off-thread fallback)...\n";
+			WaitForSingleObject(g_DumpDoneEvent, INFINITE);
 		}
 		else
 		{
-			/* Hook claimed it; wait for the (potentially long) dump to finish on the game thread. */
-			WaitForSingleObject(g_DumpDoneEvent, INFINITE);
+			std::cerr << "[Dumper-7] Waiting for the game thread to pick up the dump...\n";
+
+			/* Wait for the first tick to claim the dump. If the engine doesn't tick within the grace
+			   period, fall back to an off-thread dump (race-safe via g_DumpClaimed). */
+			constexpr DWORD FirstTickGraceMs = 20000;
+			if (WaitForSingleObject(g_DumpStartedEvent, FirstTickGraceMs) == WAIT_TIMEOUT
+				&& !g_DumpClaimed.exchange(true))
+			{
+				std::cerr << std::dec << "[Dumper-7] Game thread did not tick within " << FirstTickGraceMs
+					<< "ms - restoring hook and dumping off-thread.\n";
+				RestoreTickHook();
+				RunFullDump();
+			}
+			else
+			{
+				/* Hook claimed it; wait for the (potentially long) dump to finish on the game thread. */
+				WaitForSingleObject(g_DumpDoneEvent, INFINITE);
+			}
 		}
 	}
 	else

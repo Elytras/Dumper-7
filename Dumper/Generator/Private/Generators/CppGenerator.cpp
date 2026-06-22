@@ -1673,7 +1673,7 @@ void CppGenerator::WriteFileHead(StreamType& File, PackageInfoHandle Package, EF
 	if (!CustomIncludes.empty())
 		File << CustomIncludes + "\n";
 
-	if (Type != EFileType::BasicHpp && Type != EFileType::NameCollisionsInl && Type != EFileType::PropertyFixup && Type != EFileType::SdkHpp && Type != EFileType::DebugAssertions && Type != EFileType::UnrealContainers && Type != EFileType::UnicodeLib)
+	if (Type != EFileType::BasicCore && Type != EFileType::BasicHpp && Type != EFileType::NameCollisionsInl && Type != EFileType::PropertyFixup && Type != EFileType::SdkHpp && Type != EFileType::DebugAssertions && Type != EFileType::UnrealContainers && Type != EFileType::UnicodeLib)
 		File << "#include \"Basic.hpp\"\n";
 
 	if (Type == EFileType::SdkHpp)
@@ -1803,6 +1803,10 @@ void CppGenerator::Generate()
 	// Generate NameCollisions.inl file containing forward declarations for classes in namespaces (potentially requires lock)
 	StreamType NameCollisionsInl(MainFolder / "NameCollisions.inl");
 	GenerateNameCollisionsInl(NameCollisionsInl);
+
+	// Generate SDKCore.hpp - foundational layer (offsets/allocator/FMemory) below UnrealContainers
+	StreamType BasicCore(MainFolder / "SDKCore.hpp");
+	GenerateBasicCore(BasicCore);
 
 	// Generate UnrealContainers.hpp
 	StreamType UnrealContainers(MainFolder / "UnrealContainers.hpp");
@@ -1962,6 +1966,27 @@ using UFieldRange    = TLinkedListRange<UField>;
 	{
 		WriteFileEnd(DebugAssertions, EFileType::DebugAssertions);
 	}
+}
+
+/*
+* SelectTierBody — pick the best available implementation tier for a predefined native op.
+*
+* The 5-tier resolution policy: a generated op should run on the strongest path this build supports,
+* but must ALWAYS compile. Candidates are listed in priority order (tier 1 direct, then tier 2
+* composite, tier 3 own-impl, tier 4 reflected); the first whose `bAvailable` is true and whose body
+* is non-empty wins. If none qualify it falls to `AbortBody` (tier 5: a loud SdkUnavailable), so the
+* symbol always exists and only *calling* an unresolved op fails, loudly, at runtime. A tier with no
+* correct implementation on a given build simply supplies `{ false, "" }` and is skipped.
+*/
+struct TierCandidate { bool bAvailable; std::string Body; };
+static std::string SelectTierBody(std::initializer_list<TierCandidate> Tiers, std::string AbortBody)
+{
+	for (const TierCandidate& Tier : Tiers)
+	{
+		if (Tier.bAvailable && !Tier.Body.empty())
+			return Tier.Body;
+	}
+	return AbortBody;
 }
 
 void CppGenerator::InitPredefinedMembers()
@@ -2836,9 +2861,16 @@ void CppGenerator::InitPredefinedFunctions()
 	std::string NewObjectBody;
 	if (Settings::Internal::bHasStaticConstructObject)
 	{
-		NewObjectBody = R"({
+		/* Expected member offsets, derived from the real FName size for this build so the layout guard is correct on
+		   FNAME_OUTLINE_NUMBER / WITH_CASE_PRESERVING_NAME targets (FName != 8 bytes) instead of only the 8-byte case. */
+		auto AlignUp = [](int32 V, int32 A) { return (V + A - 1) & ~(A - 1); };
+		const int32 NameOff     = 0x10;                                          // after Class + Outer (two 8-byte ptrs)
+		const int32 SetFlagsOff = AlignUp(NameOff + Off::InSDK::Name::FNameSize, 0x4); // EObjectFlags (int32)
+		const int32 TemplateOff = AlignUp(SetFlagsOff + 0x8 + 0x2, 0x8);         // + 2x int32 flags + 2 bools, ptr-aligned
+
+		NewObjectBody = std::format(R"({{
 	struct FConstructParams
-	{
+	{{
 		const class UClass*   Class;
 		class UObject*        Outer;
 		class FName           Name;
@@ -2849,12 +2881,12 @@ void CppGenerator::InitPredefinedFunctions()
 		class UObject*        Template;
 		void*                 InstanceGraph;
 		class UObject*        ExternalPackage;
-	};
-	static_assert(offsetof(FConstructParams, Name)     == 0x10, "NewObject: FStaticConstructObjectParameters layout drift (FName size?) - would corrupt the call. Regenerate / fix the layout.");
-	static_assert(offsetof(FConstructParams, SetFlags) == 0x18, "NewObject: FStaticConstructObjectParameters layout drift.");
-	static_assert(offsetof(FConstructParams, Template) == 0x28, "NewObject: FStaticConstructObjectParameters layout drift.");
+	}};
+	static_assert(offsetof(FConstructParams, Name)     == {:#x}, "NewObject: FStaticConstructObjectParameters layout drift (FName size?) - would corrupt the call. Regenerate / fix the layout.");
+	static_assert(offsetof(FConstructParams, SetFlags) == {:#x}, "NewObject: FStaticConstructObjectParameters layout drift.");
+	static_assert(offsetof(FConstructParams, Template) == {:#x}, "NewObject: FStaticConstructObjectParameters layout drift.");
 
-	FConstructParams Params{};
+	FConstructParams Params{{}};
 	Params.Class = Class ? Class : UEType::StaticClass();
 	Params.Outer = Outer;
 	Params.Name  = Name;
@@ -2863,7 +2895,7 @@ void CppGenerator::InitPredefinedFunctions()
 
 	const auto ConstructFn = reinterpret_cast<class UObject*(*)(void*)>(InSDKUtils::GetImageBase() + Offsets::StaticConstructObjectInternal);
 	return static_cast<UEType*>(ConstructFn(&Params));
-})";
+}})", NameOff, SetFlagsOff, TemplateOff);
 	}
 	else
 	{
@@ -3995,6 +4027,40 @@ R"({
 		},
 	};
 
+	/* FTransform { FQuat Rotation; FVector Translation; FVector Scale3D; }. UE's FTransform constructors are
+	   inlined (no standalone address to forward to), so these are the native tier: trivially-correct identity
+	   + component construction. Bodies assign members (not an init-list) so the Dumper-7 size-padding members
+	   between the reflected fields are left untouched. Rotator->Transform is intentionally omitted: it needs
+	   the engine's exact euler->quat convention, i.e. the reflected UKismetMathLibrary path, not hand-rolled math. */
+	UEStruct Transform = ObjectArray::FindObjectFast<UEStruct>("Transform");
+
+	PredefinedElements& FTransformPredefs = PredefinedMembers[Transform.GetIndex()];
+
+	FTransformPredefs.Functions =
+	{
+		/* constructors */
+		PredefinedFunction{
+			.CustomComment = "Identity transform (zero rotation/translation, unit scale). Without this FTransform's reflected members are left uninitialized.",
+			.ReturnType = "", .NameWithParams = "FTransform()", .Body =
+R"({
+	Rotation.X = 0; Rotation.Y = 0; Rotation.Z = 0; Rotation.W = 1;
+	Translation.X = 0; Translation.Y = 0; Translation.Z = 0;
+	Scale3D.X = 1; Scale3D.Y = 1; Scale3D.Z = 1;
+})",
+			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = true
+		},
+		PredefinedFunction{
+			.CustomComment = "",
+			.ReturnType = "", .NameWithParams = "FTransform(const FQuat& InRotation, const FVector& InTranslation, const FVector& InScale3D = FVector(1, 1, 1))", .Body =
+R"({
+	Rotation = InRotation;
+	Translation = InTranslation;
+	Scale3D = InScale3D;
+})",
+			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = true
+		},
+	};
+
 	SortFunctions(UObjectPredefs.Functions);
 	SortFunctions(UClassPredefs.Functions);
 	SortFunctions(UEnginePredefs.Functions);
@@ -4003,52 +4069,30 @@ R"({
 	SortFunctions(FVectorPredefs.Functions);
 	SortFunctions(FVector2DPredefs.Functions);
 	SortFunctions(FRotatorPredefs.Functions);
+	SortFunctions(FTransformPredefs.Functions);
 }
 
 
-void CppGenerator::GenerateBasicFiles(StreamType& BasicHpp, StreamType& BasicCpp, StreamType& AssertionsFile)
+void CppGenerator::GenerateBasicCore(StreamType& BasicCoreHpp)
 {
 	namespace CppSettings = Settings::CppGenerator;
 
-	static auto SortMembers = [](std::vector<PredefinedMember>& Members) -> void
-	{
-		std::sort(Members.begin(), Members.end(), ComparePredefinedMembers);
-	};
+	WriteFileHead(BasicCoreHpp, nullptr, EFileType::BasicCore,
+		"Foundational SDK core: image base, offsets, allocator + FMemory. Included first by UnrealContainers.hpp so the dependency chain is strictly one-way (Core <- Containers <- Basic <- packages).",
+		"#include <cstdint>\n#include <cstddef>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <utility>");
 
-	std::string CustomIncludes = R"(#ifndef VC_EXTRALEAN
-#define VC_EXTRALEAN
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-#include <cassert>
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <iterator>
-#include <string>
-#include <algorithm>
-#include <compare>
-#include <concepts>
-#include <functional>
-#include <type_traits>
+	/* Fixed-width integer aliases: this header sits BELOW UnrealContainers (which defines UC::int32...),
+	   so we can't rely on 'using namespace UC' here - declare our own in the SDK namespace. */
+	BasicCoreHpp << R"(
+	typedef int8_t   int8;
+	typedef int16_t  int16;
+	typedef int32_t  int32;
+	typedef int64_t  int64;
+	typedef uint8_t  uint8;
+	typedef uint16_t uint16;
+	typedef uint32_t uint32;
+	typedef uint64_t uint64;
 )";
-
-	WriteFileHead(BasicHpp, nullptr, EFileType::BasicHpp, "Basic file containing structs required by the SDK", CustomIncludes);
-	WriteFileHead(BasicCpp, nullptr, EFileType::BasicCpp, "Basic file containing function-implementations from Basic.hpp", "#include <Windows.h>");
-
-
-	/* use namespace of UnrealContainers */
-	BasicHpp <<
-		R"(
-using namespace UC;
-)";
-
-	BasicHpp << "\n#include \"../NameCollisions.inl\"\n";
 
 	std::string GetNameEntryFromNameOffsetText;
 
@@ -4100,13 +4144,24 @@ using namespace UC;
 		AuxFunctionOffsetsText += std::format(
 			"\n\tconstexpr int32 FScriptMapHelperFindOrAdd      = 0x{:08X};"
 			"\n\tconstexpr int32 FScriptMapHelperRemoveAt       = 0x{:08X};"
-			"\n\tconstexpr int32 FScriptMapHelperFindPairIndex  = 0x{:08X};",
+			"\n\tconstexpr int32 FScriptMapHelperFindPairIndex  = 0x{:08X};"
+			"\n\tconstexpr int32 FScriptSetHelperRemoveElement  = 0x{:08X};"
+			"\n\tconstexpr int32 FScriptSetHelperRemoveAt       = 0x{:08X};"
+			"\n\tconstexpr int32 FScriptSetHelperAddElement     = 0x{:08X};",
 			max(Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset, 0x0),
 			max(Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset, 0x0),
-			max(Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset, 0x0));
+			max(Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset, 0x0),
+			max(Off::InSDK::ScriptContainers::FScriptSetHelperRemoveElementOffset, 0x0),
+			max(Off::InSDK::ScriptContainers::FScriptSetHelperRemoveAtOffset, 0x0),
+			max(Off::InSDK::ScriptContainers::FScriptSetHelperAddElementOffset, 0x0));
+
+	if (Settings::Internal::bHasAllocateSerialNumber)
+		AuxFunctionOffsetsText += std::format(
+			"\n\tconstexpr int32 AllocateSerialNumber = 0x{:08X};",
+			max(Off::InSDK::WeakObject::AllocateSerialNumberOffset, 0x0));
 
 	/* Offsets and disclaimer */
-	BasicHpp << std::format(R"(
+	BasicCoreHpp << std::format(R"(
 /*
 * Disclaimer:
 *	- The 'GNames' is only a fallback and null by default, FName::AppendString is used
@@ -4133,7 +4188,7 @@ namespace Offsets
 
 	if (Settings::Internal::bHasGMalloc)
 	{
-		BasicHpp <<
+		BasicCoreHpp <<
 			R"(
 namespace InSDKUtils { uintptr_t GetImageBase(); }
 
@@ -4222,7 +4277,7 @@ public:
 
 )";
 
-		BasicHpp << R"(
+		BasicCoreHpp << R"(
 
 template<typename T, typename... Args>
 T* UE_New(Args&&... args)
@@ -4265,7 +4320,7 @@ struct FMemory
 
 
 	// Start Namespace 'InSDKUtils'
-	BasicHpp <<
+	BasicCoreHpp <<
 		R"(
 namespace InSDKUtils
 {
@@ -4273,14 +4328,14 @@ namespace InSDKUtils
 
 
 	/* Custom 'GetImageBase' function */
-	BasicHpp << "\tuintptr_t GetImageBase();\n\n";
+	BasicCoreHpp << "\tuintptr_t GetImageBase();\n\n";
 
 
 	/* Always-on fatal for operations the dumper could not generate for this build. Unlike assert (stripped under
 	   NDEBUG), this always fires: the symbol stays present so dependent code still compiles against a stripped-down
 	   SDK, but a call crashes loudly with a message + a debuggable stack trace instead of silently returning a wrong
 	   result. Self-contained (only <cstdio>/<cstdlib>); no dependency on any external/mod headers. */
-	BasicHpp << R"(	[[noreturn]] inline void SdkUnavailable(const char* What)
+	BasicCoreHpp << R"(	[[noreturn]] inline void SdkUnavailable(const char* What)
 	{
 		std::fprintf(stderr, "\n[SDK FATAL] operation unavailable on this build: %s\n", What);
 		std::fflush(stderr);
@@ -4291,7 +4346,7 @@ namespace InSDKUtils
 
 
 	/* GetVirtualFunction(const void* ObjectInstance, int32 Index) function */
-	BasicHpp << R"(	template<typename FuncType>
+	BasicCoreHpp << R"(	template<typename FuncType>
 	inline FuncType GetVirtualFunction(const void* ObjectInstance, int32 Index)
 	{
 		void** VTable = *reinterpret_cast<void***>(const_cast<void*>(ObjectInstance));
@@ -4301,10 +4356,58 @@ namespace InSDKUtils
 )";
 
 	//Customizable part of Cpp code to allow for a custom 'CallGameFunction' function
-	BasicHpp << CppSettings::CallGameFunction;
+	BasicCoreHpp << CppSettings::CallGameFunction;
 
-	BasicHpp << "}\n\n";
+	BasicCoreHpp << "}\n\n";
 	// End Namespace 'InSDKUtils'
+
+	WriteFileEnd(BasicCoreHpp, EFileType::BasicCore);
+}
+
+void CppGenerator::GenerateBasicFiles(StreamType& BasicHpp, StreamType& BasicCpp, StreamType& AssertionsFile)
+{
+	namespace CppSettings = Settings::CppGenerator;
+
+	static auto SortMembers = [](std::vector<PredefinedMember>& Members) -> void
+	{
+		std::sort(Members.begin(), Members.end(), ComparePredefinedMembers);
+	};
+
+	std::string CustomIncludes = R"(#ifndef VC_EXTRALEAN
+#define VC_EXTRALEAN
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <iterator>
+#include <string>
+#include <algorithm>
+#include <compare>
+#include <concepts>
+#include <functional>
+#include <type_traits>
+)";
+
+	WriteFileHead(BasicHpp, nullptr, EFileType::BasicHpp, "Basic file containing structs required by the SDK", CustomIncludes);
+	WriteFileHead(BasicCpp, nullptr, EFileType::BasicCpp, "Basic file containing function-implementations from Basic.hpp", "#include <Windows.h>");
+
+
+	/* use namespace of UnrealContainers */
+	BasicHpp <<
+		R"(
+using namespace UC;
+)";
+
+	BasicHpp << "\n#include \"../NameCollisions.inl\"\n";
+
 
 	/* Custom 'GetImageBase' function */
 	BasicCpp << std::format(R"(uintptr_t InSDKUtils::GetImageBase()
@@ -5798,7 +5901,71 @@ public:
 		return ClassPtr != Other;
 	}
 };
+
+/* Cast<To>(Obj) / CastChecked<To>(Obj) — UE-style down/cross casts built on the generated, gen-time-tiered
+   UObject::IsA(const UClass*) (which is O(1) when the StructBaseChain offset was resolved, else a SuperStruct
+   walk). const-propagating: Cast(const T*) yields const To*. Cast returns nullptr on a type mismatch / null;
+   CastChecked asserts. To must expose StaticClass(); From must be a UObject-derived type. */
+template<typename To, typename From>
+inline std::conditional_t<std::is_const_v<From>, const To, To>* Cast(From* Obj)
+{
+	using RetT = std::conditional_t<std::is_const_v<From>, const To, To>;
+	return (Obj && Obj->IsA(To::StaticClass())) ? static_cast<RetT*>(Obj) : nullptr;
+}
+
+template<typename To, typename From>
+inline std::conditional_t<std::is_const_v<From>, const To, To>* CastChecked(From* Obj)
+{
+	using RetT = std::conditional_t<std::is_const_v<From>, const To, To>;
+	assert(Obj && Obj->IsA(To::StaticClass()) && "CastChecked: object is null or not of the requested type");
+	return static_cast<RetT*>(Obj);
+}
 )";
+
+	/* Blueprint-VM access: FFrame + the engine's native bytecode steppers + the GNatives EX-opcode dispatch
+	   table, consuming the already-resolved Offsets::FFrameStep / FFrameStepExplicitProperty / GNatives.
+	   Tier 1 (direct engine steppers) when bHasScriptVM, else a loud abort - the FFrame layout + the symbols
+	   always exist so dependent code compiles regardless. FFrame stable fields are version-independent. */
+	{
+		const bool bVM = Settings::Internal::bHasScriptVM;
+
+		const std::string StepBody = SelectTierBody({
+			{ bVM, "{ reinterpret_cast<void(*)(FFrame*, class UObject*, void*)>(InSDKUtils::GetImageBase() + Offsets::FFrameStep)(Stack, Context, Result); }" },
+		}, "{ (void)Stack; (void)Context; (void)Result; InSDKUtils::SdkUnavailable(\"ScriptVM::Step: FFrame::Step was not resolved for this build\"); }");
+
+		const std::string StepPropBody = SelectTierBody({
+			{ bVM, "{ reinterpret_cast<void(*)(FFrame*, void*, void*)>(InSDKUtils::GetImageBase() + Offsets::FFrameStepExplicitProperty)(Stack, Result, Property); }" },
+		}, "{ (void)Stack; (void)Result; (void)Property; InSDKUtils::SdkUnavailable(\"ScriptVM::StepExplicitProperty: not resolved for this build\"); }");
+
+		const std::string GNativesBody = SelectTierBody({
+			{ bVM, "{ return reinterpret_cast<void**>(InSDKUtils::GetImageBase() + Offsets::GNatives); }" },
+		}, "{ InSDKUtils::SdkUnavailable(\"ScriptVM::GNatives: GNatives offset was not resolved for this build\"); return nullptr; }");
+
+		BasicHpp <<
+"\nstruct FFrame\n"
+"{\n"
+"\tuint8          Pad00[0x10]; // vtable ptr + bool fields (engine-version-specific)\n"
+"\tvoid*          Node;        // 0x10  UFunction* being executed\n"
+"\tclass UObject* Object;      // 0x18  context object\n"
+"\tuint8*         Code;        // 0x20  current bytecode pointer\n"
+"\tuint8*         Locals;      // 0x28  parameter / locals buffer\n"
+"};\n"
+"\n"
+"namespace ScriptVM\n"
+"{\n"
+"\t// GNatives[opcode] handler signature: void(UObject* Context, FFrame& Stack, void* RESULT).\n"
+"\tusing FNativeExec = void(*)(class UObject*, FFrame&, void*);\n"
+"\n"
+"\t// EX-opcode -> handler dispatch table (the bytecode VM backbone).\n"
+"\tinline void** GNatives() " + GNativesBody + "\n"
+"\n"
+"\t// Evaluate one bytecode expression at *Stack->Code, writing the value into Result.\n"
+"\tinline void Step(FFrame* Stack, class UObject* Context, void* Result) " + StepBody + "\n"
+"\n"
+"\t// Step a known property off the stack (engine handles out-params via its OutParms walk).\n"
+"\tinline void StepExplicitProperty(FFrame* Stack, void* Result, void* Property) " + StepPropBody + "\n"
+"}\n";
+	}
 
 	const int32 TextDataSize = (Off::InSDK::Text::InTextDataStringOffset + sizeof(FString));
 
@@ -5869,6 +6036,33 @@ R"({
 	*this = UKismetTextLibrary::Conv_NameToText(FName(Str));
 })";
 
+	/* FText::FromString has both an FString&& (move) and a const FString& (copy) overload in UE. We mirror
+	   both at the SDK level off the one resolved FromString address: the move ctor hands the caller's FString
+	   straight to the engine (which takes ownership of its FMemory buffer), while the copy ctor deep-copies
+	   into a fresh FMemory-owning FString first so the caller's original is left intact. */
+	const std::string FTextFromStringMoveBody = Settings::Internal::bHasFTextCtor ?
+R"({
+	InSDKUtils::CallGameFunction(reinterpret_cast<void(*)(FText*, FString*)>(InSDKUtils::GetImageBase() + Offsets::FTextCtorFString), this, &Str);
+})" :
+R"({
+	*this = UKismetTextLibrary::Conv_NameToText(BasicFilesImpleUtils::StringToName(Str.CStr()));
+})";
+
+	const std::string FTextFromStringCopyBody = Settings::Internal::bHasFTextCtor ?
+R"({
+	const wchar_t* Src = Str.CStr();
+	const int32 Len = (Src ? Str.Len() : 0) + 1;
+	wchar_t* Buf = static_cast<wchar_t*>(FMemory::Malloc(static_cast<uint64_t>(Len) * sizeof(wchar_t)));
+	for (int32 i = 0; i < Len - 1; ++i)
+		Buf[i] = Src[i];
+	Buf[Len - 1] = L'\0';
+	FString Owning(Buf, Len, Len);
+	InSDKUtils::CallGameFunction(reinterpret_cast<void(*)(FText*, FString*)>(InSDKUtils::GetImageBase() + Offsets::FTextCtorFString), this, &Owning);
+})" :
+R"({
+	*this = UKismetTextLibrary::Conv_NameToText(BasicFilesImpleUtils::StringToName(Str.CStr()));
+})";
+
 	FText.Functions =
 	{
 		PredefinedFunction {
@@ -5883,6 +6077,16 @@ R"({
 		PredefinedFunction {
 			.CustomComment = "Construct from narrow string (widened as Latin-1; intended for ASCII)",
 			.ReturnType = "", .NameWithParams = "FText(const char* Str)", .Body = FTextNarrowCtorBody,
+			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = false
+		},
+		PredefinedFunction {
+			.CustomComment = "Construct from an FString, taking ownership of its buffer (FText::FromString(FString&&))",
+			.ReturnType = "", .NameWithParams = "FText(FString&& Str)", .Body = FTextFromStringMoveBody,
+			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = false
+		},
+		PredefinedFunction {
+			.CustomComment = "Construct from an FString without consuming it (FText::FromString(const FString&))",
+			.ReturnType = "", .NameWithParams = "FText(const FString& Str)", .Body = FTextFromStringCopyBody,
 			.bIsStatic = false, .bIsConst = false, .bIsBodyInline = false
 		},
 		PredefinedFunction {
@@ -5927,8 +6131,33 @@ R"({
 		},
 	};
 
+	/* Build a TWeakObjectPtr for any UObject: ObjectIndex = Obj->Index (InternalIndex), ObjectSerialNumber =
+	   FUObjectArray::AllocateSerialNumber(GUObjectArray, Index) when its offset resolved, else a loud abort.
+	   NOTE: the GUObjectArray base is taken as UObject::GObjects (the FUObjectArray the SDK already drives -
+	   NumElements@0x24/Objects@0x10/MasterSerialNumber@0xB0); verify this base on first use. */
+	const std::string FromObjectBody = SelectTierBody({
+		{ Settings::Internal::bHasAllocateSerialNumber, R"({
+	FWeakObjectPtr Result{};
+	if (!Object)
+		return Result;
+	Result.ObjectIndex = Object->Index;
+	const auto Fn = reinterpret_cast<int32(*)(void*, int32)>(InSDKUtils::GetImageBase() + Offsets::AllocateSerialNumber);
+	Result.ObjectSerialNumber = Fn(reinterpret_cast<void*>(UObject::GObjects), Result.ObjectIndex);
+	return Result;
+})" },
+	}, R"({
+	(void)Object;
+	InSDKUtils::SdkUnavailable("FWeakObjectPtr::FromObject: FUObjectArray::AllocateSerialNumber was not resolved for this build");
+	return FWeakObjectPtr{};
+})");
+
 	FWeakObjectPtr.Functions =
 	{
+		PredefinedFunction {
+			.CustomComment = "Construct a weak pointer to an object (resolves its serial via the engine).",
+			.ReturnType = "FWeakObjectPtr", .NameWithParams = "FromObject(class UObject* Object)", .Body = FromObjectBody,
+			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = false
+		},
 		PredefinedFunction {
 			.CustomComment = "",
 			.ReturnType = "class UObject*", .NameWithParams = "Get()", .Body =
@@ -7077,15 +7306,56 @@ namespace FieldCast
 
 	WriteFileEnd(BasicHpp, EFileType::BasicHpp);
 
-	if (Settings::Internal::bHasGMalloc)
+	/* Bridge from a reflected FMapProperty to the container-side UC::FScriptMapHelper (whose ops now live
+	   in UnrealContainers.hpp and call FMemory/Offsets directly via SDKCore.hpp). This bridge stays in Basic
+	   because it needs the FMapProperty type; emitted after the SDK body, always (so it compiles regardless
+	   of what resolved). */
 	{
-		BasicHpp << R"(
-namespace UC::Internal {
-	inline void* UEMalloc(uint64_t Count, uint32_t Alignment) { return SDK::FMemory::Malloc(Count, Alignment); }
-	inline void* UERealloc(void* Ptr, uint64_t Count, uint32_t Alignment) { return SDK::FMemory::Realloc(Ptr, Count, Alignment); }
-	inline void  UEFree(void* Ptr) { SDK::FMemory::Free(Ptr); }
-}
-)";
+		const int32 MapLayoutOff = Off::MapProperty::Base + 0x10;
+		const int32 MapFlagsOff  = Off::MapProperty::Base + 0x28;
+		const int32 SetLayoutOff = Off::SetProperty::ElementProp + 0x8; // FSetProperty: ElementProp@Base, SetLayout@Base+8
+
+		BasicHpp << std::format(R"(
+namespace SDK
+{{
+	// True if UE marked the map's key hashable at link time (CPF_HasGetValueTypeHash); editing an
+	// unhashable map asserts in-engine, so gate edits on this.
+	inline bool IsMapKeyHashable(class FMapProperty* Prop)
+	{{
+		return Prop && Prop->KeyProperty && (Prop->KeyProperty->PropertyFlags & 0x0008000000000000ULL) != 0;
+	}}
+
+	// Bridge a reflected FMapProperty to the container-side UC::FScriptMapHelper (MapData = object base + Prop->Offset).
+	inline UC::FScriptMapHelper MakeMapHelper(class FMapProperty* Prop, void* MapData)
+	{{
+		UC::FScriptMapHelper H{{}};
+		H.KeyProp   = Prop->KeyProperty;
+		H.ValueProp = Prop->ValueProperty;
+		H.Map       = MapData;
+		const unsigned char* Raw = reinterpret_cast<const unsigned char*>(Prop);
+		for (int i = 0; i < 0x18; ++i) H.MapLayout[i] = Raw[{0} + i];
+		H.MapFlags = *reinterpret_cast<const unsigned int*>(Raw + {1});
+		return H;
+	}}
+
+	// True if UE marked the set's element type hashable at link time (CPF_HasGetValueTypeHash).
+	inline bool IsSetElementHashable(class FSetProperty* Prop)
+	{{
+		return Prop && Prop->ElementProperty && (Prop->ElementProperty->PropertyFlags & 0x0008000000000000ULL) != 0;
+	}}
+
+	// Bridge a reflected FSetProperty to the container-side UC::FScriptSetHelper (SetData = object base + Prop->Offset).
+	inline UC::FScriptSetHelper MakeSetHelper(class FSetProperty* Prop, void* SetData)
+	{{
+		UC::FScriptSetHelper H{{}};
+		H.ElementProp = Prop->ElementProperty;
+		H.Set         = SetData;
+		const unsigned char* Raw = reinterpret_cast<const unsigned char*>(Prop);
+		for (int i = 0; i < 0x14; ++i) H.SetLayout[i] = Raw[{2} + i];
+		return H;
+	}}
+}}
+)", MapLayoutOff, MapFlagsOff, SetLayoutOff);
 	}
 
 	WriteFileEnd(BasicCpp, EFileType::BasicCpp);
@@ -7095,20 +7365,110 @@ namespace UC::Internal {
 /* See https://github.com/Fischsalat/UnrealContainers/blob/master/UnrealContainers/UnrealContainersNoAlloc.h */
 void CppGenerator::GenerateUnrealContainers(StreamType& UEContainersHeader)
 {
-	WriteFileHead(UEContainersHeader, nullptr, EFileType::UnrealContainers, 
-		"Container implementations with iterators. See https://github.com/Fischsalat/UnrealContainers", "#include <string>\n#include <stdexcept>\n#include <iostream>\n#include <optional>\n#include \"UtfN.hpp\"");
+	WriteFileHead(UEContainersHeader, nullptr, EFileType::UnrealContainers,
+		"Container implementations with iterators. See https://github.com/Fischsalat/UnrealContainers",
+		"#include \"SDKCore.hpp\"\n#include <string>\n#include <stdexcept>\n#include <iostream>\n#include <optional>\n#include \"UtfN.hpp\"");
 
 
 	if (Settings::Internal::bHasGMalloc)
 	{
 		UEContainersHeader << R"(
 namespace UC { namespace Internal {
-	// Implemented in Basic.hpp after UnrealAllocator is defined.
-	void* UEMalloc  (uint64_t Count, uint32_t Alignment);
-	void* UERealloc (void* Ptr, uint64_t Count, uint32_t Alignment);
-	void  UEFree    (void* Ptr);
+	// SDKCore.hpp (included above) already defines SDK::FMemory, so these are defined directly here -
+	// no forward-declare-now / define-later-in-Basic split, the dependency chain stays one-way.
+	inline void* UEMalloc  (uint64_t Count, uint32_t Alignment)            { return SDK::FMemory::Malloc(Count, Alignment); }
+	inline void* UERealloc (void* Ptr, uint64_t Count, uint32_t Alignment) { return SDK::FMemory::Realloc(Ptr, Count, Alignment); }
+	inline void  UEFree    (void* Ptr)                                     { SDK::FMemory::Free(Ptr); }
 }}
 )";
+	}
+
+	/* Reflected-TMap editor - a container operation, so it lives here. SDKCore.hpp gives us SDK::Offsets +
+	   SDK::InSDKUtils directly, so the engine calls are emitted INLINE (no trampolines). 5-tier resolution
+	   per op: tier 1 direct engine fn when its offset resolved, else tier 5 abort - always compiles.
+	   RemoveByKey is the tier-2 composite (FindPairIndex + RemoveAt; UE has no out-of-line RemovePair).
+	   Build a helper from an FMapProperty with SDK::MakeMapHelper(prop, mapData). */
+	{
+		const bool bDirFindOrAdd = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset      != 0;
+		const bool bDirFindPair  = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset != 0;
+		const bool bDirRemoveAt  = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset      != 0;
+
+		const std::string FindOrAddBody = SelectTierBody({
+			{ bDirFindOrAdd, "{ return reinterpret_cast<void*(*)(void*, const void*)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptMapHelperFindOrAdd)(this, KeyPtr); }" },
+		}, "{ (void)KeyPtr; SDK::InSDKUtils::SdkUnavailable(\"FScriptMapHelper::FindOrAdd was not resolved for this build - e.g. UE4.27 inlines it\"); return nullptr; }");
+
+		const std::string FindPairBody = SelectTierBody({
+			{ bDirFindPair, "{ return reinterpret_cast<int32_t(*)(void*, const void*)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptMapHelperFindPairIndex)(this, KeyPtr); }" },
+		}, "{ (void)KeyPtr; SDK::InSDKUtils::SdkUnavailable(\"FScriptMapHelper::FindMapPairIndexFromHash was not resolved for this build\"); return -1; }");
+
+		const std::string RemoveAtBody = SelectTierBody({
+			{ bDirRemoveAt, "{ reinterpret_cast<void(*)(void*, int32_t)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptMapHelperRemoveAt)(this, PairIndex); }" },
+		}, "{ (void)PairIndex; SDK::InSDKUtils::SdkUnavailable(\"FScriptMapHelper::RemoveAt was not resolved for this build\"); }");
+
+		const bool bDirSetRemoveElement = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptSetHelperRemoveElementOffset != 0;
+		const bool bDirSetRemoveAt      = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptSetHelperRemoveAtOffset      != 0;
+
+		const std::string SetRemoveElementBody = SelectTierBody({
+			{ bDirSetRemoveElement, "{ return reinterpret_cast<bool(*)(void*, const void*)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptSetHelperRemoveElement)(this, ElementPtr); }" },
+		}, "{ (void)ElementPtr; SDK::InSDKUtils::SdkUnavailable(\"FScriptSetHelper::RemoveElement was not resolved for this build - e.g. UE4.27 inlines it\"); return false; }");
+
+		const std::string SetRemoveAtBody = SelectTierBody({
+			{ bDirSetRemoveAt, "{ reinterpret_cast<void(*)(void*, int32_t, int32_t)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptSetHelperRemoveAt)(this, Index, Count); }" },
+		}, "{ (void)Index; (void)Count; SDK::InSDKUtils::SdkUnavailable(\"FScriptSetHelper::RemoveAt was not resolved for this build\"); }");
+
+		const bool bDirSetAddElement = Settings::Internal::bHasScriptContainers && Off::InSDK::ScriptContainers::FScriptSetHelperAddElementOffset != 0;
+
+		// Tier 1 (direct): the one-call FScriptSetHelper::AddElement(this, elem) -> sparse index; it builds its
+		// own hash/eq/construct/destruct closures and dedups (re-adding an existing element returns its index).
+		// Out-of-line only where the build keeps the helper (DRG/FSD UE4.27); RC/RogueCore UE5 inlines it,
+		// leaving only the variadic core TScriptSet::Add -> abort tier here (tier-2 composite is the RC path).
+		const std::string SetAddElementBody = SelectTierBody({
+			{ bDirSetAddElement, "{ return reinterpret_cast<int32_t(*)(void*, const void*)>(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::FScriptSetHelperAddElement)(this, ElementPtr); }" },
+		}, "{ (void)ElementPtr; SDK::InSDKUtils::SdkUnavailable(\"FScriptSetHelper::AddElement was not resolved for this build - e.g. UE4.27 inlines it\"); return -1; }");
+
+		UEContainersHeader <<
+"namespace UC\n"
+"{\n"
+"/*\n"
+"FScriptMapHelper - the engine's own type-erased 0x38 reflected-TMap editor. Build one from an FMapProperty\n"
+"+ the live map data (object base + prop->Offset) via SDK::MakeMapHelper, then FindOrAdd(key) -> value slot,\n"
+"FindPairIndex(key) -> index/-1, RemoveAt(index), RemoveByKey(key). Gate edits on SDK::IsMapKeyHashable.\n"
+"*/\n"
+"struct alignas(8) FScriptMapHelper\n"
+"{\n"
+"\tconst void* KeyProp;          // 0x00\n"
+"\tconst void* ValueProp;        // 0x08\n"
+"\tvoid*       Map;              // 0x10  FScriptMap* (live container data)\n"
+"\tuint8_t     MapLayout[0x18];  // 0x18  copied from the FMapProperty\n"
+"\tuint32_t    MapFlags;         // 0x30\n"
+"\tuint32_t    Pad;              // 0x34\n"
+"\n"
+"\tvoid*   FindOrAdd    (const void* KeyPtr) " + FindOrAddBody + "\n"
+"\tint32_t FindPairIndex(const void* KeyPtr) " + FindPairBody + "\n"
+"\tvoid    RemoveAt     (int32_t PairIndex)  " + RemoveAtBody + "\n"
+"\tbool    RemoveByKey  (const void* KeyPtr) { int32_t Idx = FindPairIndex(KeyPtr); if (Idx < 0) return false; RemoveAt(Idx); return true; }\n"
+"};\n"
+"static_assert(sizeof(FScriptMapHelper) == 0x38, \"FScriptMapHelper must be 0x38\");\n"
+"\n"
+"/*\n"
+"FScriptSetHelper - the engine's own type-erased 0x28 reflected-TSet editor. Build one from an FSetProperty\n"
+"+ the live set data (object base + prop->Offset) via SDK::MakeSetHelper, then AddByElement(elem) -> index,\n"
+"RemoveByElement(elem) -> bool, or RemoveAt(index). Gate edits on SDK::IsSetElementHashable. AddByElement is\n"
+"the one-call engine insert (dedups; returns the existing index if already present); it resolves only where\n"
+"the build keeps FScriptSetHelper::AddElement out-of-line (e.g. DRG/UE4.27) - elsewhere it aborts loudly.\n"
+"*/\n"
+"struct alignas(8) FScriptSetHelper\n"
+"{\n"
+"\tconst void* ElementProp;      // 0x00\n"
+"\tvoid*       Set;              // 0x08  FScriptSet* (live container data)\n"
+"\tuint8_t     SetLayout[0x14];  // 0x10  copied from the FSetProperty\n"
+"\n"
+"\tint32_t AddByElement   (const void* ElementPtr) " + SetAddElementBody + "\n"
+"\tbool    RemoveByElement(const void* ElementPtr) " + SetRemoveElementBody + "\n"
+"\tvoid    RemoveAt       (int32_t Index, int32_t Count = 1) " + SetRemoveAtBody + "\n"
+"};\n"
+"static_assert(sizeof(FScriptSetHelper) == 0x28, \"FScriptSetHelper must be 0x28\");\n"
+"}\n";
 	}
 
 	UEContainersHeader << R"(
@@ -7612,6 +7972,19 @@ namespace UC
 				return std::wstring(Data);
 
 			return L"";
+		}
+
+		/* Convert to std::string and immediately release this FString's buffer via FMemory::Free, so an
+		   engine-returned (FMemory-owning) FString can be drained in one step instead of leaking. Only call
+		   this on an OWNING FString (e.g. one returned by a reflected getter / FText::ToString) — never on a
+		   non-owning view built from FString(const wchar_t*), whose buffer FMemory does not own. */
+		inline std::string ToStringConsume()
+		{
+			std::string Out = ToString();
+			if (Data) { Internal::UEFree(Data); Data = nullptr; }
+			NumElements = 0;
+			MaxElements = 0;
+			return Out;
 		}
 
 	public:

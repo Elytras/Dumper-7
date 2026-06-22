@@ -56,6 +56,7 @@ private:
 
         NameCollisionsInl,
 
+        BasicCore,
         BasicHpp,
         BasicCpp,
 
@@ -130,6 +131,7 @@ private:
 
     static void GenerateSDKHeader(StreamType& SdkHpp);
 
+    static void GenerateBasicCore(StreamType& BasicCoreHpp);
     static void GenerateBasicFiles(StreamType& BasicH, StreamType& BasicCpp, StreamType& AssertionsFile);
 
     /*

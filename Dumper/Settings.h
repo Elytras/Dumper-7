@@ -22,16 +22,34 @@ namespace Settings
 		inline int SleepTimeout = 0;
 		inline std::string SDKNamespaceName = "SDK";
 
+		/* Opt-in: before dumping, OR EInternalObjectFlags::RootSet onto every live FUObjectItem so GC keeps
+		   everything alive (fuller dumps; pairs with force-loading assets first). "Cursed": the game never GCs
+		   those objects again for the rest of its lifetime, so it's off by default. Dumper-7.ini [Settings]
+		   KeepObjectsAlive=1. When on, the dump does NOT run immediately - the Tick hook keeps re-rooting
+		   every tick so you can roam/load the game, and the dump fires only when DumpHotkey is pressed. */
+		inline bool bKeepObjectsAliveForDump = true;
+
+		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode (default 0x79 = VK_F10).
+		   Dumper-7.ini [Settings] DumpHotkey=0x79 (decimal or 0x-hex). */
+		inline int DumpHotkey = 0x79;
+
+		/* Opt-in: run alongside the mod DLL, which also hooks UGameEngine::Tick. The mod hooks the real
+		   Tick by RVA, so the two coexist (engine -> d7 vtable hook -> g_OriginalTick by RVA -> mod's
+		   MinHook -> real Tick). When set, d7 will NOT fall back to an off-thread dump on the first-tick
+		   grace timeout: an off-thread dump races GC, and is needless while the mod keeps the game ticking.
+		   Dumper-7.ini [Settings] CoexistWithMod=1. */
+		inline bool bCoexistWithMod = true;
+
 		void Load();
 	};
 
 	namespace EngineCore
 	{
 		/* A special setting to fix UEnum::Names where the type is sometimes TArray<FName> and sometimes TArray<TPair<FName, Some8BitData>> */
-		constexpr bool bCheckEnumNamesInUEnum = false;
+		constexpr bool bCheckEnumNamesInUEnum = true;
 
 		/* Enables support for TEncryptedObjectProperty */
-		constexpr bool bEnableEncryptedObjectPropertySupport = false;
+		constexpr bool bEnableEncryptedObjectPropertySupport = true;
 	}
 
 	namespace Generator
@@ -180,6 +198,9 @@ R"(
 
 		/* Whether the reflected-container edit helpers (FScriptMapHelper::FindOrAdd/RemoveAt) were located */
 		inline bool bHasScriptContainers = false;
+
+		/* Whether FUObjectArray::AllocateSerialNumber was located (TWeakObjectPtr construction) */
+		inline bool bHasAllocateSerialNumber = false;
 	}
 
 	extern void InitWeakObjectPtrSettings();

@@ -648,15 +648,77 @@ void Off::InSDK::ScriptContainers::InitScriptContainers()
 		Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset =
 			static_cast<int32>(reinterpret_cast<uint8_t*>(findPair) - reinterpret_cast<uint8_t*>(base));
 
-	if (findOrAdd || removeAt || findPair)
+	// FScriptSetHelper::RemoveElement(this in rcx, ElementPtr in rdx) -> bool (one-call remove-by-value).
+	const char* setRemoveElementSig =
+		"4C 8B DC 53 56 41 56 48 83 EC ?? 48 8B 01 4D 8D 4B D8 4C 8B F1 49 89 43 08 49 89 43 18 49 8D 4B 08 49 8D 43 18 49 89 4B";
+	void* const setRemoveElement = Platform::FindPattern(setRemoveElementSig, 0x0, false, 0x0, nullptr);
+	if (setRemoveElement)
+		Off::InSDK::ScriptContainers::FScriptSetHelperRemoveElementOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(setRemoveElement) - reinterpret_cast<uint8_t*>(base));
+
+	// FScriptSetHelper::RemoveAt(this in rcx, Index in edx, Count in r8d).
+	const char* setRemoveAtSig =
+		"48 89 5C 24 10 48 89 6C 24 18 57 48 83 EC ?? 41 8B E8 8B DA 48 8B F9 E8 ?? ?? ?? ?? 85 ED 0F 84 ?? ?? ?? ?? 48 89 74 24";
+	void* const setRemoveAt = Platform::FindPattern(setRemoveAtSig, 0x0, false, 0x0, nullptr);
+	if (setRemoveAt)
+		Off::InSDK::ScriptContainers::FScriptSetHelperRemoveAtOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(setRemoveAt) - reinterpret_cast<uint8_t*>(base));
+
+	// FScriptSetHelper::AddElement(this in rcx, ElementPtr in rdx) -> int32 sparse index (one-call insert-by-
+	// value; builds its 4 closures then tail-calls core TScriptSet::Add). Fingerprint = the helper unpack:
+	// mov r9,[rcx]=ElementProp; lea r8,[rcx+0x10]=&SetLayout; movups xmm0,[r8]; mov rcx,[rcx+8]=Set. Frame-size
+	// immediate + security-cookie disp masked.
+	const char* setAddElementSig =
+		"4C 8B DC 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? "
+		"4C 8B 09 4C 8D 41 10 41 0F 10 00 48 8B 49 08 48 8D 44 24";
+	void* const setAddElement = Platform::FindPattern(setAddElementSig, 0x0, false, 0x0, nullptr);
+	if (setAddElement)
+		Off::InSDK::ScriptContainers::FScriptSetHelperAddElementOffset =
+			static_cast<int32>(reinterpret_cast<uint8_t*>(setAddElement) - reinterpret_cast<uint8_t*>(base));
+
+	if (findOrAdd || removeAt || findPair || setRemoveElement || setRemoveAt || setAddElement)
 	{
 		Settings::Internal::bHasScriptContainers = true;
 		std::cerr << std::format(
-			"ScriptContainers: FScriptMapHelper::FindOrAdd 0x{:X} | RemoveAt 0x{:X} | FindPairIndex 0x{:X}\n",
+			"ScriptContainers: FScriptMapHelper::FindOrAdd 0x{:X} | RemoveAt 0x{:X} | FindPairIndex 0x{:X} | "
+			"FScriptSetHelper::RemoveElement 0x{:X} | RemoveAt 0x{:X} | AddElement 0x{:X}\n",
 			Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset,
 			Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset,
-			Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset);
+			Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset,
+			Off::InSDK::ScriptContainers::FScriptSetHelperRemoveElementOffset,
+			Off::InSDK::ScriptContainers::FScriptSetHelperRemoveAtOffset,
+			Off::InSDK::ScriptContainers::FScriptSetHelperAddElementOffset);
 	}
+#endif
+#endif
+}
+
+/*
+* Off::InSDK::WeakObject::InitAllocateSerialNumber
+*
+* FUObjectArray::AllocateSerialNumber(this=GUObjectArray, int32 Index) -> int32 serial. Signature CONSTRUCTED
+* from the verified RC RVA (no portable sig existed): the prologue + FUObjectItem index math is engine-stable
+* and rip-relative-free, so it needs no masking beyond the one rel8 'jge' displacement:
+*   push rdi; sub rsp,20h; cmp edx,[rcx+24h](NumElements); jge ..; mov r8,[rcx+10h](Objects); movzx eax,dx;
+*   shr r9,10h; lea rdx,[rax+rax*2]; mov rax,[r8+r9*8]; lea rdi,[rax+rdx*8](0x18 stride).
+* Same shape on UE4.27 (DRG) and UE5.6 (RC) - only the RVA differs.
+*/
+void Off::InSDK::WeakObject::InitAllocateSerialNumber()
+{
+#ifdef PLATFORM_WINDOWS
+#if defined(_WIN64)
+	const char* sig = "40 57 48 83 EC 20 3B 51 24 7D ?? 4C 8B 41 10 44 8B CA 0F B7 C2 49 C1 E9 10 48 8D 14 40 4B 8B 04 C8 48 8D 3C D0";
+	void* const Fn = Platform::FindPattern(sig, 0x0, false, 0x0, nullptr);
+	if (!Fn)
+	{
+		std::cerr << "FUObjectArray::AllocateSerialNumber: pattern not matched, skipping (TWeakObjectPtr builder unavailable).\n";
+		return;
+	}
+
+	Off::InSDK::WeakObject::AllocateSerialNumberOffset =
+		static_cast<int32>(reinterpret_cast<uint8_t*>(Fn) - reinterpret_cast<uint8_t*>(Platform::GetModuleBase()));
+	Settings::Internal::bHasAllocateSerialNumber = true;
+	std::cerr << std::format("FUObjectArray::AllocateSerialNumber: 0x{:X}\n", Off::InSDK::WeakObject::AllocateSerialNumberOffset);
 #endif
 #endif
 }

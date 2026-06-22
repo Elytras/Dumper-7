@@ -141,7 +141,25 @@ namespace Off
 			inline int32 FScriptMapHelperFindOrAddOffset = 0x0;       // FScriptMapHelper::FindOrAdd
 			inline int32 FScriptMapHelperRemoveAtOffset = 0x0;        // FScriptMapHelper::RemoveAt
 			inline int32 FScriptMapHelperFindPairIndexOffset = 0x0;   // FScriptMapHelper::FindMapPairIndexFromHash
+			// Reflected-TSet edit (sibling of the map helpers). RemoveElement = one-call remove-by-value
+			// (builds hash/eq itself); RemoveAt = remove by sparse index; AddElement = one-call insert-by-value
+			// (builds its own hash/eq/construct/destruct closures, then calls core TScriptSet::Add). All three
+			// are out-of-line on builds that don't inline the helper (e.g. DRG/FSD UE4.27 keeps AddElement
+			// out-of-line); they stay 0 where the build inlines them (e.g. RC/RogueCore UE5 inlines AddElement,
+			// leaving only the variadic core TScriptSet::Add) → that part of set-edit falls to the abort tier.
+			inline int32 FScriptSetHelperRemoveElementOffset = 0x0;   // FScriptSetHelper::RemoveElement
+			inline int32 FScriptSetHelperRemoveAtOffset = 0x0;        // FScriptSetHelper::RemoveAt
+			inline int32 FScriptSetHelperAddElementOffset = 0x0;      // FScriptSetHelper::AddElement
 			void InitScriptContainers();
+		}
+
+		namespace WeakObject
+		{
+			// FUObjectArray::AllocateSerialNumber(this=GUObjectArray, int32 Index) -> int32 serial. Lets the SDK
+			// build a TWeakObjectPtr for any UObject (ObjectIndex = UObject->InternalIndex; ObjectSerialNumber =
+			// AllocateSerialNumber(...)). Engine-stable index math (FUObjectItem 0x18 stride). Module-relative.
+			inline int32 AllocateSerialNumberOffset = 0x0;
+			void InitAllocateSerialNumber();
 		}
 
 		namespace ULevel

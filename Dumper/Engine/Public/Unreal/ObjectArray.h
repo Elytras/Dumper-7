@@ -31,10 +31,18 @@ public:
 private:
 	static inline void*(*ByIndex)(void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) = nullptr;
 
+	/* Same navigation as ByIndex but returns the ADDRESS of the FUObjectItem's Object slot (not the
+	   dereferenced UObject*), so callers can reach sibling FUObjectItem fields - notably Flags @ +0x8.
+	   Set alongside ByIndex in each Init path (identical math, no final deref). Used by KeepAllFromGC. */
+	static inline void*(*ItemAddrByIndex)(void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) = nullptr;
+
 	static inline uint8_t* (*DecryptPtr)(void* ObjPtr) = [](void* Ptr) -> uint8* { return static_cast<uint8*>(Ptr); };
 
 private:
 	static void InitializeFUObjectItem(uint8_t* FirstItemPtr);
+
+	/* OR EInternalObjectFlags::RootSet onto items in [Begin, End); shared by KeepAllFromGC / KeepNewFromGC. */
+	static int32 KeepRangeFromGC(int32 Begin, int32 End);
 
 public:
 	static void InitDecryption(uint8_t* (*DecryptionFunction)(void* ObjPtr), const char* DecryptionLambdaAsStr);
@@ -43,6 +51,17 @@ public:
 
 	static void Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& ObjectArrayLayout = FFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
 	static void Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChunkedFixedUObjectArrayLayout& ObjectArrayLayout = FChunkedFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
+
+	/* Opt-in "cursed" GC-keep: OR EInternalObjectFlags::RootSet (0x40000000) onto live FUObjectItems so the
+	   engine's GC never collects them -> fuller dumps (and force-loaded assets survive to the dump). Pure
+	   memory walk via ItemAddrByIndex; returns the number of items flagged.
+	     KeepAllFromGC()        - full sweep [0, Num()); use for the final pass right before dumping.
+	     KeepNewFromGC(MaxBatch) - incremental: roots [cursor, min(cursor+MaxBatch, Num())) and advances a
+	         persistent forward cursor. Cheap to call every tick - already-rooted objects are immortal so
+	         their slots never move/free, meaning we never need to re-mark them; we only march over freshly
+	         spawned objects (a few skipped is fine). MaxBatch<=0 means "to the end". */
+	static int32 KeepAllFromGC();
+	static int32 KeepNewFromGC(int32 MaxBatch);
 
 	static void DumpObjects(const fs::path& Path, bool bWithPathname = false);
 	static void DumpObjectsWithProperties(const fs::path& Path, bool bWithPathname = false);

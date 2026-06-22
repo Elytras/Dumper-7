@@ -132,4 +132,13 @@ void Settings::Config::Load()
 
 	SDKNamespaceName = SDKNamespace;
 	SleepTimeout = max(GetPrivateProfileIntA("Settings", "SleepTimeout", 0, ConfigPath), 0);
+	/* Default to the compile-time value (Settings.h), so a missing ini key / absent ini file keeps the
+	   built-in default instead of silently forcing the flag off. An explicit ini entry still overrides. */
+	bKeepObjectsAliveForDump = GetPrivateProfileIntA("Settings", "KeepObjectsAlive", bKeepObjectsAliveForDump ? 1 : 0, ConfigPath) != 0;
+	bCoexistWithMod          = GetPrivateProfileIntA("Settings", "CoexistWithMod",   bCoexistWithMod          ? 1 : 0, ConfigPath) != 0;
+
+	char HotkeyStr[32] = {};
+	GetPrivateProfileStringA("Settings", "DumpHotkey", "", HotkeyStr, sizeof(HotkeyStr), ConfigPath);
+	if (HotkeyStr[0]) // accept decimal or 0x-hex
+		DumpHotkey = static_cast<int>(std::strtol(HotkeyStr, nullptr, 0));
 }

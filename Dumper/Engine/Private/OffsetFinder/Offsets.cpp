@@ -281,13 +281,21 @@ static bool IsFTextFromStringPrimitive(uintptr_t Fn)
 
 	const uintptr_t Range = End - Fn;
 
-	// The FText-from-FString primitive that Conv_NameToText reaches allocates an FTextHistory_Base
-	// (operator new(0x38) = 'mov ecx, 0x38' = B9 38 00 00 00) and flags the result CultureInvariant
-	// ('or dword[reg+8], 2' = 83 ?? 08 02). NOTE: the reflected Conv_NameToText path hits the
-	// CultureInvariant-ONLY variant (flag 0x02); the CultureInvariant|Transient variant (0x12) is only
-	// reachable via FText::FromName, which Conv_NameToText does not call. Requiring BOTH the 0x38 alloc
-	// and the flag-set keeps the (looser) 0x02 immediate from matching the GC/FFrame helpers that are
-	// also reachable from the exec stub.
+	// FText layout differs by engine, so the CultureInvariant flag-set we anchor on does too:
+	//   UE4.27 (DRG): 24-byte FText {FTextData* @0; FSharedRefController* @8; uint32 Flags @0x10}.
+	//                 Conv_NameToText -> FText::AsCultureInvariant(FString) sets 'or dword[reg+0x10], 2'
+	//                 (= 83 ?? 10 02) and builds via FText::GetEmpty + refcounting (NO FTextHistory_Base
+	//                 operator new(0x38)), so the flag-set alone anchors it. Imm 0x02 (CultureInvariant
+	//                 only) is the variant Conv_NameToText reaches; the 0x12 (|Transient) variant lives in
+	//                 FText::FromString, which Conv_NameToText does not call.
+	//   UE5.x:        16-byte intrusive-refcount FText (Flags @ +0x8). The primitive allocates an
+	//                 FTextHistory_Base (operator new(0x38) = 'mov ecx, 0x38' = B9 38 00 00 00) and sets
+	//                 'or dword[reg+8], 2' (= 83 ?? 08 02). Requiring BOTH keeps the (looser) 0x02 immediate
+	//                 from matching the GC/FFrame helpers also reachable from the exec stub.
+	// Gate on the already-resolved FText size (>= 0x18 == UE4.27 24-byte shape).
+	if (Off::InSDK::Text::TextSize >= 0x18)
+		return Platform::FindPatternInRange("83 ?? 10 02", Fn, Range) != nullptr;
+
 	return Platform::FindPatternInRange("83 ?? 08 02", Fn, Range) != nullptr
 		&& Platform::FindPatternInRange("B9 38 00 00 00", Fn, Range) != nullptr;
 }
@@ -338,7 +346,7 @@ void Off::InSDK::Text::InitFTextCtorFString()
 
 	Off::InSDK::Text::FTextCtorFStringOffset = static_cast<int32>(FromString - Platform::GetModuleBase());
 	Settings::Internal::bHasFTextCtor = true;
-	std::cerr << std::format("FText::FromString (Flags|=0x12 anchor): 0x{:X}\n",
+	std::cerr << std::format("FText::FromString (CultureInvariant builder): 0x{:X}\n",
 		Off::InSDK::Text::FTextCtorFStringOffset);
 #endif
 #endif
@@ -696,19 +704,34 @@ void Off::InSDK::ScriptContainers::InitScriptContainers()
 /*
 * Off::InSDK::WeakObject::InitAllocateSerialNumber
 *
-* FUObjectArray::AllocateSerialNumber(this=GUObjectArray, int32 Index) -> int32 serial. Signature CONSTRUCTED
-* from the verified RC RVA (no portable sig existed): the prologue + FUObjectItem index math is engine-stable
-* and rip-relative-free, so it needs no masking beyond the one rel8 'jge' displacement:
-*   push rdi; sub rsp,20h; cmp edx,[rcx+24h](NumElements); jge ..; mov r8,[rcx+10h](Objects); movzx eax,dx;
-*   shr r9,10h; lea rdx,[rax+rax*2]; mov rax,[r8+r9*8]; lea rdi,[rax+rdx*8](0x18 stride).
-* Same shape on UE4.27 (DRG) and UE5.6 (RC) - only the RVA differs.
+* FUObjectArray::AllocateSerialNumber(this=GUObjectArray, int32 Index) -> int32 serial. The prologue +
+* FUObjectItem (0x18 stride) index math is rip-relative-free, but MSVC emits the index->chunk math two
+* different ways across builds, so we carry one signature per family (frame-size + rel8 'jge' masked):
+*   A (UE5.6 / RC): push rdi; sub rsp,20h; cmp edx,[rcx+24h](NumElements); jge ..; mov r8,[rcx+10h](Objects);
+*     movzx eax,dx; shr r9,10h; lea rdx,[rax+rax*2]; mov rax,[r8+r9*8]; lea rdi,[rax+rdx*8].
+*   B (UE4.27 / DRG): push rdi; sub rsp,30h; mov r9,rcx; cmp edx,[rcx+24h]; jge ..; signed split
+*     (mov eax,edx; cdq; movzx edx,dx; add eax,edx; movzx eax,ax; sub eax,edx; sar r8d,10h; ...);
+*     mov rdx,[rcx+10h](Objects); lea rcx,[rax+rax*2]; mov rax,[rdx+r8*8]; lea rdi,[rax+rcx*8].
+* GUObjectArray layout (Objects @+0x10, NumElements @+0x24) is shared; only the codegen + RVA differ.
 */
 void Off::InSDK::WeakObject::InitAllocateSerialNumber()
 {
 #ifdef PLATFORM_WINDOWS
 #if defined(_WIN64)
-	const char* sig = "40 57 48 83 EC 20 3B 51 24 7D ?? 4C 8B 41 10 44 8B CA 0F B7 C2 49 C1 E9 10 48 8D 14 40 4B 8B 04 C8 48 8D 3C D0";
-	void* const Fn = Platform::FindPattern(sig, 0x0, false, 0x0, nullptr);
+	const char* const sigs[] = {
+		// A: UE5.6 / RogueCore
+		"40 57 48 83 EC 20 3B 51 24 7D ?? 4C 8B 41 10 44 8B CA 0F B7 C2 49 C1 E9 10 48 8D 14 40 4B 8B 04 C8 48 8D 3C D0",
+		// B: UE4.27 / Deep Rock Galactic
+		"40 57 48 83 EC ?? 4C 8B C9 3B 51 24 7D ?? 8B C2 99 0F B7 D2 03 C2 44 8B C0 0F B7 C0 2B C2 48 8B 51 10 48 98 41 C1 F8 10 4D 63 C0 48 8D 0C 40 4A 8B 04 C2 48 8D 3C C8",
+	};
+
+	void* Fn = nullptr;
+	for (const char* sig : sigs)
+	{
+		Fn = Platform::FindPattern(sig, 0x0, false, 0x0, nullptr);
+		if (Fn)
+			break;
+	}
 	if (!Fn)
 	{
 		std::cerr << "FUObjectArray::AllocateSerialNumber: pattern not matched, skipping (TWeakObjectPtr builder unavailable).\n";

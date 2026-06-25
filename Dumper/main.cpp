@@ -396,11 +396,24 @@ DWORD MainThread(HMODULE Module)
 		}
 		else if (Settings::Config::bCoexistWithMod)
 		{
-			/* Coexist mode: the mod also hooks Tick, so the engine is proven to tick - never fall back to an
-			   off-thread dump (it would race GC while the mod keeps the game live). Block until the game
-			   thread claims and finishes the dump. */
-			std::cerr << "[Dumper-7] Waiting for the game thread to pick up the dump (coexist: no off-thread fallback)...\n";
-			WaitForSingleObject(g_DumpDoneEvent, INFINITE);
+			/* Coexist mode: the mod owns the game-thread Tick hook (by RVA). Our vtable hook is redundant and,
+			   in some games, isn't even on the path the engine calls Tick through - so it never claims the dump
+			   and waiting on it hangs forever. Don't wait: claim the dump and run it off-thread. Root all live
+			   objects first so the snapshot is stable against a GC firing on the (still-live) game thread. If a
+			   tick DID claim it through our hook, let that game-thread dump finish instead. */
+			if (!g_DumpClaimed.exchange(true))
+			{
+				std::cerr << "[Dumper-7] Coexist mode - dumping off-thread (mod keeps the game ticking)...\n";
+				RestoreTickHook();
+				const int32 Flagged = ObjectArray::KeepAllFromGC();
+				std::cerr << std::format("[Dumper-7] Flagged {} live objects RootSet (GC-keep for off-thread dump).\n", Flagged);
+				RunFullDump();
+			}
+			else
+			{
+				std::cerr << "[Dumper-7] Game thread claimed the dump - waiting for it to finish...\n";
+				WaitForSingleObject(g_DumpDoneEvent, INFINITE);
+			}
 		}
 		else
 		{

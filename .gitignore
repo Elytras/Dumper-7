@@ -365,3 +365,4 @@ MigrationBackup/
 out/
 # Local build helper (driven by modcli MCP), not part of upstream Dumper-7
 /build.ps1
+*.json

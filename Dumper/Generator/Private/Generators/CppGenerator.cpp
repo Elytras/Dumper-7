@@ -6142,7 +6142,7 @@ R"({
 		return Result;
 	Result.ObjectIndex = Object->Index;
 	const auto Fn = reinterpret_cast<int32(*)(void*, int32)>(InSDKUtils::GetImageBase() + Offsets::AllocateSerialNumber);
-	Result.ObjectSerialNumber = Fn(reinterpret_cast<void*>(UObject::GObjects), Result.ObjectIndex);
+	Result.ObjectSerialNumber = Fn(UObject::GObjects.GetTypedPtr(), Result.ObjectIndex);
 	return Result;
 })" },
 	}, R"({
@@ -6227,6 +6227,43 @@ public:
 		return static_cast<UEType*>(FWeakObjectPtr::Get());
 	}
 };
+)";
+
+
+	/* Robust IsValid<T = UObject> — GObjects-direct liveness (valid iff non-null AND its own slot in GObjects
+	   still holds it: catches BOTH collection and slot-reuse, unlike a flags-only deref), plus a class check
+	   when T != UObject. ONE template branches via `if constexpr`: T == UObject → liveness only; else → liveness
+	   AND `Object->IsA(T)`, so `IsValid<APawn>(anyUObjectPtr)` = "live AND an APawn" (a Cast<T> with a liveness
+	   guard; the param stays const UObject* so a BASE pointer is class-checkable). The liveness helper lives in
+	   Basic.cpp because it needs the full UObject (only forward-declared here); `T::StaticClass()` is dependent
+	   so the else branch is instantiated only when reached. NOTE: reads Object->Index, so a wild pointer is on
+	   the caller — for an unowned handle, hold a TWeakObjectPtr. */
+	BasicCpp <<
+		R"(
+bool IsValidOfClass(const class UObject* Object, class UClass* Class)
+{
+	if (!Object)
+		return false;
+
+	if (UObject::GObjects->GetByIndex(Object->Index) != Object)
+		return false;
+
+	return !Class || Object->IsA(Class);
+}
+)";
+
+	BasicHpp <<
+		R"(
+bool IsValidOfClass(const class UObject* Object, class UClass* Class);
+
+template<typename T = class UObject>
+inline bool IsValid(const class UObject* Object)
+{
+	if constexpr (std::is_same_v<T, class UObject>)
+		return IsValidOfClass(Object, nullptr);
+	else
+		return IsValidOfClass(Object, T::StaticClass());
+}
 )";
 
 

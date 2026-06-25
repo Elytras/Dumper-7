@@ -26,8 +26,10 @@ namespace Settings
 		   everything alive (fuller dumps; pairs with force-loading assets first). "Cursed": the game never GCs
 		   those objects again for the rest of its lifetime, so it's off by default. Dumper-7.ini [Settings]
 		   KeepObjectsAlive=1. When on, the dump does NOT run immediately - the Tick hook keeps re-rooting
-		   every tick so you can roam/load the game, and the dump fires only when DumpHotkey is pressed. */
-		inline bool bKeepObjectsAliveForDump = true;
+		   every tick so you can roam/load the game, and the dump fires only when DumpHotkey is pressed.
+		   Off by default: the interactive wait relies on our game-thread Tick hook firing, which it doesn't
+		   in some games (leaving the dumper stuck) - opt in via the INI once that's reliable. */
+		inline bool bKeepObjectsAliveForDump = false;
 
 		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode (default 0x79 = VK_F10).
 		   Dumper-7.ini [Settings] DumpHotkey=0x79 (decimal or 0x-hex). */
@@ -38,7 +40,7 @@ namespace Settings
 		   MinHook -> real Tick). When set, d7 will NOT fall back to an off-thread dump on the first-tick
 		   grace timeout: an off-thread dump races GC, and is needless while the mod keeps the game ticking.
 		   Dumper-7.ini [Settings] CoexistWithMod=1. */
-		inline bool bCoexistWithMod = true;
+		inline bool bCoexistWithMod = false;
 
 		void Load();
 	};

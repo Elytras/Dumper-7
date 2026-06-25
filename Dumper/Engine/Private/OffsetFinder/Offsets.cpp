@@ -193,6 +193,24 @@ static uintptr_t GetKismetExecAddress(const char* const FunctionName)
 * call-subtree from the stub (depth-bounded, each body bounded by FindFunctionEnd so a scan can't bleed
 * into an adjacent function) instead of scanning only the stub. Decoupled from the FText finder.
 */
+/*
+* Validate a candidate is FName::FName(wchar_t*, EFindName), not a false positive that merely also
+* took 'mov r8d, 1'. The ctor is pure logic — it scans the wide string and makes only DIRECT calls
+* (E8) into FNameHelper (ParseNumber / MakeWithNumber); it never calls an import. The classic false
+* positive (an FCsvProfiler stat-record call, also preceded by 'mov r8d, 1' for its int arg) calls
+* TlsGetValue / QueryPerformanceCounter through the IAT — i.e. it contains 'FF 15' (call [rip+IAT]).
+* So: reject any candidate whose body has an indirect import call.
+*/
+static bool LooksLikeFNameCtor(uintptr_t Fn)
+{
+	if (!Platform::IsAddressInProcessRange(Fn))
+		return false;
+
+	const uintptr_t End = Architecture_x86_64::FindFunctionEnd(Fn, 0x400);
+	const uintptr_t Range = (End > Fn && (End - Fn) <= 0x400) ? (End - Fn) : 0x120;
+	return Platform::FindPatternInRange("FF 15", Fn, Range) == nullptr;
+}
+
 static uintptr_t FindFNameCtorViaImmediate(uintptr_t Fn)
 {
 	if (!Platform::IsAddressInProcessRange(Fn))
@@ -203,13 +221,25 @@ static uintptr_t FindFNameCtorViaImmediate(uintptr_t Fn)
 
 	// 41 B8 01 00 00 00 = mov r8d, 1 (EFindName::FNAME_Add). The compiler may hoist it ~0x1C above the
 	// call (setnz/add/cmp/mov/cmovnz in between), so DON'T require adjacency — anchor on the immediate,
-	// then resolve the first 'call rel32' that follows it.
-	void* const Hit = Platform::FindPatternInRange("41 B8 01 00 00 00", Fn, Range);
-	if (!Hit)
-		return 0x0;
+	// then resolve the first 'call rel32' that follows it. 'mov r8d, 1' is a weak anchor (any 3rd-arg=1
+	// call matches), so iterate EVERY occurrence and validate each target; skip false positives (e.g. an
+	// FCsvProfiler stat call) and return the first that looks like the ctor. Returning 0 (rather than the
+	// first false positive) lets the caller's recursion keep descending to where the real ctor is called.
+	uintptr_t Cursor = Fn;
+	while (Cursor < Fn + Range)
+	{
+		void* const Hit = Platform::FindPatternInRange("41 B8 01 00 00 00", Cursor, (Fn + Range) - Cursor);
+		if (!Hit)
+			break;
 
-	const uintptr_t Ctor = Architecture_x86_64::GetRipRelativeCalledFunction(reinterpret_cast<uintptr_t>(Hit), 1, nullptr);
-	return Platform::IsAddressInProcessRange(Ctor) ? Ctor : 0x0;
+		const uintptr_t HitAddr = reinterpret_cast<uintptr_t>(Hit);
+		const uintptr_t Cand = Architecture_x86_64::GetRipRelativeCalledFunction(HitAddr, 1, nullptr);
+		if (Platform::IsAddressInProcessRange(Cand) && LooksLikeFNameCtor(Cand))
+			return Cand;
+
+		Cursor = HitAddr + 6;   // past this 6-byte immediate; keep scanning
+	}
+	return 0x0;
 }
 
 static uintptr_t FindFNameCtorWcharRec(uintptr_t Fn, int32 Depth)

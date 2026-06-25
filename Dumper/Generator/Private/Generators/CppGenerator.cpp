@@ -1309,6 +1309,18 @@ std::string CppGenerator::GetMemberTypeStringWithoutConst(UEProperty Member, int
 
 		return "TMulticastInlineDelegate<void()>";
 	}
+	else if (Flags & EClassCastFlags::MulticastSparseDelegateProperty)
+	{
+		/* Sparse multicast: a 1-byte inline FSparseDelegate{bIsBound}; the real invocation list lives in
+		   the global FSparseDelegateStorage keyed by (owner, DelegateName). Emit a typed 1-byte wrapper
+		   that ALSO carries the delegate name as a C++20 NTTP, so both the signature and the store-lookup
+		   name are recoverable from the field's type (see Lib_Delegate). SignatureFunction shares the
+		   FMulticastDelegateProperty offset, so the inline-property cast reads it correctly. */
+		if (UEFunction SignatureFunc = Member.Cast<UEMulticastInlineDelegateProperty>().GetSignatureFunction()) [[likely]]
+			return std::format("TMulticastSparseDelegate<{}, \"{}\">", GetFunctionSignature(SignatureFunc), Member.GetName());
+
+		return std::format("TMulticastSparseDelegate<void(), \"{}\">", Member.GetName());
+	}
 	else if (Flags & EClassCastFlags::FieldPathProperty)
 	{
 		if (Settings::Internal::bIsObjPtrInsteadOfFieldPathProperty)
@@ -6834,6 +6846,40 @@ public:
 	};
 
 	GenerateStruct(&TMulticastInlineDelegateSpezialiation, BasicHpp, BasicCpp, BasicHpp, AssertionsFile);
+
+	/* TDelegateName + TMulticastSparseDelegate<Ret(Args...), Name> — sparse multicast delegate field.
+	   The inline storage is just a 1-byte FSparseDelegate{bIsBound}; the real invocation list lives in
+	   the global FSparseDelegateStorage keyed by (owner, DelegateName). The delegate name rides in the
+	   type as a C++20 NTTP so it is recoverable from the field alone (Lib_Delegate reads ::DelegateName).
+	   Emitted as raw text (not a PredefinedStruct) to carry the NTTP + the static-constexpr name. */
+	BasicHpp << R"(
+template<unsigned N>
+struct TDelegateName
+{
+	char Value[N]{};
+	constexpr TDelegateName(const char (&Str)[N]) { for (unsigned i = 0; i < N; ++i) Value[i] = Str[i]; }
+};
+
+// Predefined struct TMulticastSparseDelegate
+// 0x0001 (0x0001 - 0x0000)
+template<typename FunctionSignature, TDelegateName Name>
+class TMulticastSparseDelegate
+{
+public:
+	struct InvalidUseOfTMulticastSparseDelegate   TemplateParamIsNotAFunctionSignature;              // 0x0000(0x0001)(NOT AUTO-GENERATED PROPERTY)
+};
+
+// Predefined struct TMulticastSparseDelegate<Ret(Args...), Name>
+// 0x0001 (0x0001 - 0x0000)
+template<typename Ret, typename... Args, TDelegateName Name>
+class TMulticastSparseDelegate<Ret(Args...), Name>
+{
+public:
+	uint8                                         bIsBound;                                          // 0x0000(0x0001)(NOT AUTO-GENERATED PROPERTY)
+	static constexpr const char*                  DelegateName = Name.Value;                         // FSparseDelegateStorage key (NTTP)
+};
+
+)";
 
 
 	/* UE_ENUM_OPERATORS - enum flag operations */

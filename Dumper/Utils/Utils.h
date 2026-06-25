@@ -27,7 +27,7 @@ inline void* FindUnrealExecFunctionByString(Type RefStr, void* StartAddress = nu
 	const auto [ImageBase, ImageSize] = GetImageBaseAndSize();
 
 	uint8_t* SearchStart = StartAddress ? reinterpret_cast<uint8_t*>(StartAddress) : reinterpret_cast<uint8_t*>(ImageBase);
-	DWORD SearchRange = ImageSize;
+	DWORD SearchRange = static_cast<DWORD>(ImageSize);
 
 	const int32_t RefStrLen = StrlenHelper(RefStr);
 

@@ -1,4 +1,5 @@
 #include <format>
+#include <unordered_map>
 
 #include "Utils.h"
 
@@ -353,21 +354,18 @@ void Off::InSDK::Text::InitFTextCtorFString()
 }
 
 /*
-* UGameEngine::Tick — anchored off UGameEngine::HandleBrowseToDefaultMapFailure.
+* UGameEngine::Tick (UGameEngine inherits UEngine::Tick unless overridden) — anchored on "CAUSEEVENT ".
 *
-* HandleBrowseToDefaultMapFailure contains a `lea rN, [rip+disp]` loading the unique UTF-16 literal
-* "UGameEngine::HandleBrowseToDefaultMapFailure" (passed to a Request-Exit call). Once we find which
-* UGameEngine vtable slot's function contains that LEA, Tick sits at a known fixed offset earlier in
-* the override block:
+* UEngine::Tick's causeevent-URL handler builds a console command from the ANSI literal "CAUSEEVENT "
+* (the FURL "causeevent=" option). That literal survives shipping on both engines and is referenced from
+* exactly ONE site — inside Tick — on both FSD/DRG (UE4.27, +0x496) and RC (UE5.6, +0x456), verified via
+* IDA. So the UGameEngine CDO vtable slot whose function contains the LEA *is* Tick directly: no
+* neighbor-slot delta or size heuristic needed.
 *
-*     Tick                            vtable[N - 7 or N - 8]
-*     GetMaxTickRate, ProcessToggleFreeze*, NetworkRemapPath, ShouldDoAsyncEndOfFrameTasks
-*     [Exec]                          (only when UE_ALLOW_EXEC_COMMANDS == 1)
-*     GetGameViewportWidget
-*     HandleBrowseToDefaultMapFailure vtable[N]
-*
-* Window is widened to {-6..-9} to absorb minor UE5.x layout shifts; pick the largest function in that
-* window (Tick is ~2-5KB, comfortably larger than Exec).
+* (Earlier anchors failed: the wide L"UGameEngine::HandleBrowseToDefaultMapFailure" is stripped from
+* shipping entirely, and the CSV-profiler "EngineTickMisc" exists only when CSV_PROFILER is compiled in —
+* present on DRG, absent on RC. When the finder fails, bHasGameEngineTick stays false, the dump falls back
+* to its off-thread path, and that races GC → AppendString crash in DumpspaceGenerator.)
 */
 void Off::InSDK::Engine::InitUGameEngineTick()
 {
@@ -395,32 +393,28 @@ void Off::InSDK::Engine::InitUGameEngineTick()
 		return;
 	}
 
-	// FindByStringInAllSections returns the LEA address, not the string address. Resolve to verify.
+	// FindByStringInAllSections (ANSI overload) returns the referencing LEA, not the string address.
+	// "CAUSEEVENT " is referenced from exactly one site on both engines, and that site is inside Tick.
 	const void* const LeaAddr = Platform::FindByStringInAllSections(
-		L"UGameEngine::HandleBrowseToDefaultMapFailure", 0x0, 0x0, /*bSearchOnlyExecutableSections=*/true);
+		"CAUSEEVENT ", 0x0, 0x0, /*bSearchOnlyExecutableSections=*/true);
 	if (!LeaAddr)
 	{
-		std::cerr << "UGameEngine::Tick: no LEA referencing 'UGameEngine::HandleBrowseToDefaultMapFailure' found, skipping.\n";
+		std::cerr << "UGameEngine::Tick: no LEA referencing \"CAUSEEVENT \" found, skipping (override manually).\n";
 		return;
 	}
 
-	const uintptr_t StringTarget = Architecture_x86_64::Resolve32BitRelativeLea(reinterpret_cast<uintptr_t>(LeaAddr));
-	if (!Platform::IsAddressInProcessRange(StringTarget))
-	{
-		std::cerr << "UGameEngine::Tick: resolved string address out of range, skipping.\n";
-		return;
-	}
-
-	// Find the vtable slot whose function contains the LEA: largest slot start <= LEA, within a sane
-	// function-size bound. Avoids FindFunctionEnd, which doesn't terminate on jmp-tail-call functions.
+	// The slot whose function CONTAINS the LEA is Tick itself (the anchor lives inside Tick, not in a
+	// neighbor): take the largest slot start <= LEA within a generous function-size bound. Functions are
+	// contiguous, so Tick's start is the unique vtable-slot start just below the LEA. (No FindFunctionEnd —
+	// it doesn't terminate on jmp-tail-call functions.)
 	const uintptr_t LeaAddrUint = reinterpret_cast<uintptr_t>(LeaAddr);
 	const int32 StartIdx = Off::InSDK::ProcessEvent::PEIndex + 1;
 	const int32 EndIdx = StartIdx + 0x80;
 
-	constexpr uintptr_t MaxPlausibleFnSize = 0x400;
+	constexpr uintptr_t MaxPlausibleFnSize = 0x4000; // Tick is large; the LEA can sit deep inside it
 
-	int32 AnchorIdx = -1;
-	uintptr_t BestSlotAddr = 0;
+	int32 TickIdx = -1;
+	uintptr_t TickAddr = 0;
 	for (int32 i = StartIdx; i < EndIdx; ++i)
 	{
 		const uintptr_t SlotAddr = reinterpret_cast<uintptr_t>(Vft[i]);
@@ -432,62 +426,26 @@ void Off::InSDK::Engine::InitUGameEngineTick()
 		if (LeaAddrUint - SlotAddr > MaxPlausibleFnSize)
 			continue;
 
-		if (SlotAddr > BestSlotAddr)
+		if (SlotAddr > TickAddr)
 		{
-			BestSlotAddr = SlotAddr;
-			AnchorIdx = i;
+			TickAddr = SlotAddr;
+			TickIdx = i;
 		}
 	}
 
-	if (AnchorIdx == -1)
+	if (TickIdx == -1)
 	{
-		std::cerr << "UGameEngine::Tick: LEA address not contained by any UGameEngine vtable slot, skipping.\n";
+		std::cerr << "UGameEngine::Tick: \"CAUSEEVENT \" LEA not contained by any UGameEngine vtable slot, skipping.\n";
 		return;
 	}
 
 	const uint64 base = Platform::GetModuleBase();
-
-	// Tick is the largest function in {-6..-9} from the anchor.
-	int32 BestTickIdx = -1;
-	uintptr_t BestTickTarget = 0;
-	uintptr_t BestTickSize = 0x400;
-
-	for (int32 Delta = 6; Delta <= 9; ++Delta)
-	{
-		const int32 TickIdx = AnchorIdx - Delta;
-		if (TickIdx <= Off::InSDK::ProcessEvent::PEIndex)
-			continue;
-
-		const uintptr_t Target = reinterpret_cast<uintptr_t>(Vft[TickIdx]);
-		if (!Platform::IsAddressInProcessRange(Target))
-			continue;
-
-		const uintptr_t End = Architecture_x86_64::FindFunctionEnd(Target, 0x4000);
-		const uintptr_t Size = End ? (End - Target) : 0;
-
-		if (Size > BestTickSize)
-		{
-			BestTickSize = Size;
-			BestTickTarget = Target;
-			BestTickIdx = TickIdx;
-		}
-	}
-
-	if (BestTickIdx != -1)
-	{
-		Off::InSDK::Engine::UGameEngineTickOffset = static_cast<int32>(BestTickTarget - base);
-		Off::InSDK::Engine::UGameEngineTickIndex = BestTickIdx;
-		Settings::Internal::bHasGameEngineTick = true;
-		std::cerr << std::format(
-			"UGameEngine::Tick: 0x{:X} (vtable[{}], HandleBrowse anchor at vtable[{}], size 0x{:X})\n",
-			Off::InSDK::Engine::UGameEngineTickOffset, BestTickIdx, AnchorIdx, BestTickSize);
-	}
-	else
-	{
-		std::cerr << std::format(
-			"UGameEngine::Tick: HandleBrowse at vtable[{}] but no slot in [-9..-6] looks like Tick, override manually.\n",
-			AnchorIdx);
-	}
+	Off::InSDK::Engine::UGameEngineTickOffset = static_cast<int32>(TickAddr - base);
+	Off::InSDK::Engine::UGameEngineTickIndex = TickIdx;
+	Settings::Internal::bHasGameEngineTick = true;
+	std::cerr << std::format(
+		"UGameEngine::Tick: 0x{:X} (vtable[{}], anchored on \"CAUSEEVENT \" LEA 0x{:X})\n",
+		Off::InSDK::Engine::UGameEngineTickOffset, TickIdx, static_cast<uintptr_t>(LeaAddrUint - base));
 #endif
 #endif
 }
@@ -519,35 +477,75 @@ void Off::InSDK::Construct::InitStaticConstructObjectInternal()
 	// D: mov [rsp+10/18/20], rbx/rbp/rsi; push rdi/r14/r15; sub rsp, N
 	const char* sigD = "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 81 EC ?? ?? ?? ??";
 
-	struct Candidate { const char* sig; const char* family; };
-	const Candidate candidates[] = { {sigA, "A"}, {sigB, "B"}, {sigC, "C"}, {sigD, "D"} };
+	const char* const sigs[] = { sigA, sigB, sigC, sigD };
 
-	void* match = nullptr;
-	const char* matchedFamily = nullptr;
-	for (const auto& c : candidates)
+	/*
+	These prologue families are GENERIC (shared by many functions), so the old "first pattern match
+	wins" landed on an unrelated function — on FSD/DRG it grabbed sub_1408B9FD0 (0 callers) instead of
+	the real StaticConstructObject_Internal @0x1F9C870, and SDK::UObject::NewObject then called a bad
+	address and crashed. Disambiguate by CALLER COUNT: SCO is called from thousands of sites, while a
+	coincidental prologue match has ~none. Collect every match across all families, tally direct
+	(E8 rel32) calls to each candidate in one .text pass, and take the most-called.
+	*/
+	std::unordered_map<uintptr_t, int> callers; // candidate addr -> # of E8 calls targeting it
+	for (const char* const sig : sigs)
 	{
-		match = Platform::FindPattern(c.sig, 0x0, false, 0x0, nullptr);
-		if (match)
+		// NOTE: StartAddress is honored ONLY on the bSearchAllSections=true path
+		// (GetSearchStartAndRangeBasedOnOverrides). With bSearchAllSections=false, FindPattern
+		// always rescans .text from the section base, so the resume below would loop forever on
+		// the first match. Prologue matches outside .text are harmless — they get 0 callers and
+		// are dropped by the threshold.
+		uintptr_t start = 0x0;
+		while (void* m = Platform::FindPattern(sig, 0x0, /*bSearchAllSections=*/true, start))
 		{
-			matchedFamily = c.family;
-			break;
+			callers.emplace(reinterpret_cast<uintptr_t>(m), 0);
+			start = reinterpret_cast<uintptr_t>(m) + 0x1;
 		}
 	}
 
-	if (!match)
+	if (callers.empty())
 	{
 		std::cerr << "StaticConstructObject_Internal: no prologue pattern matched, override manually.\n";
 		return;
 	}
 
+	Platform::IterateSectionWithCallback(Platform::GetSectionInfo(".text"),
+		[&callers](void* Address) -> bool
+		{
+			const uint8_t* const p = reinterpret_cast<const uint8_t*>(Address);
+			if (*p != 0xE8)
+				return false;
+			const int32_t rel = *reinterpret_cast<const int32_t*>(p + 1);
+			const uintptr_t target = reinterpret_cast<uintptr_t>(p) + 5 + rel;
+			const auto it = callers.find(target);
+			if (it != callers.end())
+				++it->second;
+			return false; // scan the whole section
+		}, 0x1, 0x8);
+
+	uintptr_t best = 0x0;
+	int bestCallers = -1;
+	for (const auto& [addr, count] : callers)
+	{
+		if (count > bestCallers) { bestCallers = count; best = addr; }
+	}
+
+	// SCO is called from thousands of sites; require a real caller count so a stray match can't win.
+	if (best == 0x0 || bestCallers < 16)
+	{
+		std::cerr << std::format(
+			"StaticConstructObject_Internal: best of {} prologue candidate(s) has only {} caller(s) — "
+			"unreliable, override manually.\n", callers.size(), bestCallers);
+		return;
+	}
+
 	const uint64 base = Platform::GetModuleBase();
-	Off::InSDK::Construct::StaticConstructObjectInternalOffset =
-		static_cast<int32>(reinterpret_cast<uint8_t*>(match) - reinterpret_cast<uint8_t*>(base));
+	Off::InSDK::Construct::StaticConstructObjectInternalOffset = static_cast<int32>(best - base);
 	Settings::Internal::bHasStaticConstructObject = true;
 
 	std::cerr << std::format(
-		"StaticConstructObject_Internal (family {}): 0x{:X}\n",
-		matchedFamily, Off::InSDK::Construct::StaticConstructObjectInternalOffset);
+		"StaticConstructObject_Internal: 0x{:X} ({} callers, {} prologue candidates)\n",
+		Off::InSDK::Construct::StaticConstructObjectInternalOffset, bestCallers, callers.size());
 #endif
 #endif
 }

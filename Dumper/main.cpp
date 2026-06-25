@@ -299,6 +299,7 @@ static bool InstallTickHook()
 
 	std::vector<void**> SeenVtables;
 	int32 NumInstances = 0;
+	int32 NumHooked = 0; // local success count — the game-thread hook may clear g_PatchedSlots mid-install
 
 	for (UEObject Obj : ObjectArray())
 	{
@@ -332,6 +333,7 @@ static bool InstallTickHook()
 		if (WriteVTableSlot(Slot, reinterpret_cast<void*>(&TickHook)))
 		{
 			g_PatchedSlots.emplace_back(Slot, Original);
+			++NumHooked;
 
 			const bool bOverride = reinterpret_cast<uintptr_t>(Original) != reinterpret_cast<uintptr_t>(g_OriginalTick);
 			std::cerr << std::format("[Dumper-7] Hooked Tick in engine vtable 0x{:X} (slot[{}] was 0x{:X}){}\n",
@@ -340,14 +342,17 @@ static bool InstallTickHook()
 		}
 	}
 
-	if (g_PatchedSlots.empty())
+	if (NumHooked == 0)
 	{
 		std::cerr << std::format("[Dumper-7] No engine vtables hooked ({} instance(s) seen) - cannot sync to game thread.\n", NumInstances);
 		return false;
 	}
 
+	// Report NumHooked, not g_PatchedSlots.size(): the game-thread hook can fire and clear g_PatchedSlots
+	// (RestoreTickHook) before we reach here. That's success — returning false would trigger a redundant,
+	// GC-unsafe second dump off-thread (two RunFullDump() races → output-folder rename collision).
 	std::cerr << std::format("[Dumper-7] Installed Tick hook on {} engine vtable(s) at slot[{}] ({} instance(s) seen).\n",
-		g_PatchedSlots.size(), g_TickIdx, NumInstances);
+		NumHooked, g_TickIdx, NumInstances);
 	return true;
 }
 

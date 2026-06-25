@@ -139,7 +139,10 @@ namespace
 			const LDR_DATA_TABLE_ENTRY* Entry = reinterpret_cast<const LDR_DATA_TABLE_ENTRY*>(P);
 
 			const std::wstring WideModuleName(Entry->BaseDllName.Buffer, Entry->BaseDllName.Length >> 1);
-			const std::string ModuleName = std::string(WideModuleName.begin(), WideModuleName.end());
+			std::string ModuleName;
+			ModuleName.reserve(WideModuleName.size());
+			for (const wchar_t WideChar : WideModuleName)
+				ModuleName.push_back(static_cast<char>(WideChar));
 
 			if (Utils::StrToLower(ModuleName) == LowercaseSearchModuleName)
 				return Entry;
@@ -230,7 +233,7 @@ namespace
 		const std::string LowercaseSearchModuleName = Utils::StrToLower(ModuleToImportFrom);
 
 		/* Loop all modules and if we found the right one, loop all imports to get the one we need */
-		for (const IMAGE_IMPORT_DESCRIPTOR* Import = ImportTable; Import && Import->Characteristics != 0x0; Import++)
+		for (const IMAGE_IMPORT_DESCRIPTOR __unaligned* Import = ImportTable; Import && Import->Characteristics != 0x0; Import++)
 		{
 			if (Import->Name == 0xFFFF)
 				continue;
@@ -287,7 +290,7 @@ namespace
 		const uintptr_t SectionStartAddress = ModuleBase + SectionHeader->VirtualAddress;
 		const uintptr_t SectionEndAddress = SectionStartAddress + SectionHeader->Misc.VirtualSize;
 
-		uint32_t SearchRange = (Range > 0x0 && Range < SectionHeader->Misc.VirtualSize) ? Range : SectionHeader->Misc.VirtualSize;
+		uint32_t SearchRange = (Range > 0x0 && static_cast<uint32_t>(Range) < SectionHeader->Misc.VirtualSize) ? Range : SectionHeader->Misc.VirtualSize;
 		uintptr_t SearchStartAddress = SectionStartAddress;
 
 		// Check if this section contains the StartAddress
@@ -298,7 +301,7 @@ namespace
 				return { NULL, 0x0 };
 
 			SearchStartAddress = StartAddress;
-			SearchRange = SectionEndAddress - StartAddress;
+			SearchRange = static_cast<uint32_t>(SectionEndAddress - StartAddress);
 		}
 
 		return { SearchStartAddress, SearchRange };
@@ -428,7 +431,7 @@ void* PlatformWindows::IterateSectionWithCallback(const SectionInfo& Info, const
 		return nullptr;
 
 	const uintptr_t SectionBaseAddrss = WinSectionInfo.Imagebase + WinSectionInfo.SectionHeader->VirtualAddress;
-	const uint32_t SectionIterationSize = GetAlignedSizeWithOffsetFromEnd(WinSectionInfo.SectionHeader->Misc.VirtualSize, Granularity, OffsetFromEnd);
+	const uint32_t SectionIterationSize = static_cast<uint32_t>(GetAlignedSizeWithOffsetFromEnd(WinSectionInfo.SectionHeader->Misc.VirtualSize, Granularity, OffsetFromEnd));
 
 	if (SectionIterationSize == -1)
 		return nullptr;
@@ -575,7 +578,7 @@ const void* PlatformWindows::GetAddressOfExportedFunction(const char* SearchModu
 	const WORD* Ordinals = reinterpret_cast<const WORD*>(ModuleBase + ExportTable->AddressOfNameOrdinals);
 
 	/* Iterate all names and return the function if the name matches what we're looking for */
-	for (int i = 0; i < ExportTable->NumberOfFunctions; i++)
+	for (DWORD i = 0; i < ExportTable->NumberOfFunctions; i++)
 	{
 		const WORD NameIndex = Ordinals[i];
 		const char* Name = reinterpret_cast<const char*>(ModuleBase + NameOffsets[NameIndex]);
@@ -729,7 +732,7 @@ void* PlatformWindows::FindPatternInRange(std::vector<int>&& Signature, const vo
 			if (bRelative)
 			{
 				if (Offset == -1)
-					Offset = PatternLength;
+					Offset = static_cast<uint32_t>(PatternLength);
 
 				Address = ((Address + Offset + 4) + *reinterpret_cast<int32_t*>(Address + Offset));
 			}

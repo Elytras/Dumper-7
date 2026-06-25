@@ -44,7 +44,7 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 
 		constexpr uint32 BytePropertyStartAsUint32 = 'etyB'; // "Byte" part of "ByteProperty"
 
-		Off::FNameEntry::NamePool::StringOffset = NameEntryStringOffset;
+		Off::FNameEntry::NamePool::StringOffset = static_cast<int32>(NameEntryStringOffset);
 		Off::FNameEntry::NamePool::HeaderOffset = NameEntryStringOffset == 6 ? 4 : 0;
 
 		const uint8* AssumedBytePropertyEntry = *reinterpret_cast<uint8* const*>(FirstChunkPtr) + NameEntryStringOffset + NoneStrLen;
@@ -280,12 +280,12 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 		return false;
 
 	NameEntryStride = FNameEntryHeaderSize == 2 ? 2 : 4;
-	Off::InSDK::NameArray::FNameEntryStride = NameEntryStride;
+	Off::InSDK::NameArray::FNameEntryStride = static_cast<int32>(NameEntryStride);
 
 	ByIndex = [](void* NamesArray, int32 ComparisonIndex, int32 NamePoolBlockOffsetBits) -> void*
 	{
 		const int32 ChunkIdx = ComparisonIndex >> NamePoolBlockOffsetBits;
-		const int32 InChunkOffset = (ComparisonIndex & ((1 << NamePoolBlockOffsetBits) - 1)) * NameEntryStride;
+		const int32 InChunkOffset = static_cast<int32>((ComparisonIndex & ((1 << NamePoolBlockOffsetBits) - 1)) * NameEntryStride);
 
 		const bool bIsBeyondLastChunk = ChunkIdx == NameArray::GetNumChunks() && InChunkOffset > NameArray::GetByteCursor();
 
@@ -383,7 +383,7 @@ bool NameArray::TryFindNameArray_Windows()
 		if (!Platform::IsAddressInProcessRange(Address) || Platform::IsBadReadPtr(*reinterpret_cast<void**>(Address)))
 			return false;
 
-		Off::InSDK::NameArray::GNames = Platform::GetOffset(Address);
+		Off::InSDK::NameArray::GNames = static_cast<int32>(Platform::GetOffset(Address));
 		return true;
 	}
 
@@ -408,7 +408,7 @@ bool NameArray::TryFindNameArray_Windows()
 		if (Platform::IsBadReadPtr(ValueOfMoveTargetAsPtr) || ValueOfMoveTargetAsPtr != Names)
 			continue;
 
-		Off::InSDK::NameArray::GNames = Platform::GetOffset(MoveTarget);
+		Off::InSDK::NameArray::GNames = static_cast<int32>(Platform::GetOffset(MoveTarget));
 		return true;
 	}
 	
@@ -492,7 +492,7 @@ bool NameArray::TryFindNamePool_Windows()
 
 	if (NamePoolIntance)
 	{
-		Off::InSDK::NameArray::GNames = Platform::GetOffset(NamePoolIntance);
+		Off::InSDK::NameArray::GNames = static_cast<int32>(Platform::GetOffset(NamePoolIntance));
 		return true;
 	}
 

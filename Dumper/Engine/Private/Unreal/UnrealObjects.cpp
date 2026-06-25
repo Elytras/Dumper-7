@@ -248,7 +248,14 @@ bool UEObject::HasAnyFlags(EObjectFlags Flags) const
 
 bool UEObject::IsA(EClassCastFlags TypeFlags) const
 {
-	return (TypeFlags != EClassCastFlags::None ? GetClass().IsType(TypeFlags) : true);
+	if (TypeFlags == EClassCastFlags::None)
+		return true;
+
+	// A malformed/transient object can have a null Class (e.g. partially-constructed objects in GObjects,
+	// seen on RC's ramrod). GetClass().IsType() would read Class->CastFlags (+0xD8) off null → AV. A
+	// classless object IsA nothing.
+	const UEClass Class = GetClass();
+	return Class && Class.IsType(TypeFlags);
 }
 
 bool UEObject::IsA(UEClass Class) const
@@ -339,7 +346,7 @@ std::string UEObject::GetFullName(int32& OutNameLength) const
 		}
 
 		std::string Name = GetName();
-		OutNameLength = Name.size() + 1;
+		OutNameLength = static_cast<int32>(Name.size() + 1);
 
 		Name = GetClass().GetName() + ' ' + Temp + Name;
 
@@ -475,7 +482,7 @@ std::vector<std::pair<FName, int64>> UEEnum::GetNameValuePairs() const
 		const int64* Values = reinterpret_cast<int64*>(*reinterpret_cast<uintptr_t*>(Object + EnumNamesOffset + 0x8) & PointerMaskNoTag);
 		const int32 NumValues = *reinterpret_cast<int32*>(Object + EnumNamesOffset + 0x10);
 
-		for (uint32_t i = 0; i < NumValues; i++)
+		for (int32 i = 0; i < NumValues; i++)
 		{
 			Ret.push_back({ FName(NamesPtr + (i * FNameSize)), Values[i] });
 		}

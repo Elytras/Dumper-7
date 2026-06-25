@@ -47,7 +47,7 @@ std::pair<std::string, uint8> PackageInfoHandle::GetNameCollisionPair() const
 	if (Name.IsUniqueInTable()) [[likely]]
 		return { Name.GetName(), 0 };
 
-	return { Name.GetName(), Info->CollisionCount };
+	return { Name.GetName(), static_cast<uint8>(Info->CollisionCount) };
 }
 
 bool PackageInfoHandle::HasClasses() const

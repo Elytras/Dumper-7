@@ -261,7 +261,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 			GObjects = static_cast<uint8*>(GObjectsAddress);
 			NumElementsPerChunk = -1;
 
-			Off::InSDK::ObjArray::GObjects = Platform::GetOffset(GObjectsAddress);
+			Off::InSDK::ObjArray::GObjects = static_cast<int32>(Platform::GetOffset(GObjectsAddress));
 
 			std::cerr << "Found FFixedUObjectArray GObjects at offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n\n";
 
@@ -299,7 +299,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 			SizeOfFUObjectItem = sizeof(void*) + sizeof(int32) + sizeof(int32);
 			FUObjectItemInitialOffset = 0x0;
 
-			Off::InSDK::ObjArray::GObjects = Platform::GetOffset(GObjectsAddress);
+			Off::InSDK::ObjArray::GObjects = static_cast<int32>(Platform::GetOffset(GObjectsAddress));
 
 			std::cerr << "Found FChunkedFixedUObjectArray GObjects at offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n\n";
 

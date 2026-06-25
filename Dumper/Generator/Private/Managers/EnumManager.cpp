@@ -72,7 +72,7 @@ const StringEntry& EnumInfoHandle::GetName() const
 
 int32 EnumInfoHandle::GetNumMembers() const
 {
-	return Info->MemberInfos.size();
+	return static_cast<int32>(Info->MemberInfos.size());
 }
 
 CollisionInfoIterator EnumInfoHandle::GetMemberCollisionInfoIterator() const
@@ -158,7 +158,7 @@ void EnumManager::InitInternal()
 					NewOrExistingInfo.bIsSigned = true;
 
 				if (!NameWitPrefix.ends_with(L"_MAX"))
-					EnumMaxValue = max(EnumMaxValue, Value);
+					EnumMaxValue = max(EnumMaxValue, static_cast<uint64>(Value));
 
 				auto [NameIndex, bWasInserted] = UniqueEnumValueNames.FindOrAdd(MakeNameValid(NameWitPrefix.substr(NameWitPrefix.find_last_of(L"::") + 1)));
 

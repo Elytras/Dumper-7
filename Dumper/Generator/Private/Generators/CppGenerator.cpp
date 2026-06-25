@@ -963,6 +963,16 @@ std::string CppGenerator::GetStructPrefixedName(const StructWrapper& Struct)
 	if (!Struct.GetUnrealStruct())
 		return "UObject";
 
+	// A malformed/transient object can have a null Class pointer (seen on RC while on the ramrod with multiple
+	// PersistentLevels — partially-constructed objects live in GObjects). IsFunction()/GetUniqueName() below
+	// read Class->CastFlags (+0xD8); on a null Class that AVs at 0xD8 and kills the whole dump. Fall back to
+	// UObject instead. (GetName reads only the object's FName, no Class deref, so it's safe here.)
+	if (!Struct.GetUnrealStruct().GetClass())
+	{
+		std::cerr << std::format("[CppGenerator] WARNING: struct '{}' has a null Class (malformed object) — using UObject\n", Struct.GetName());
+		return "UObject";
+	}
+
 	if (Struct.IsFunction())
 		return Struct.GetUnrealStruct().GetOuter().GetValidName() + "_" + Struct.GetName();
 
@@ -6230,14 +6240,16 @@ public:
 )";
 
 
-	/* Robust IsValid<T = UObject> — GObjects-direct liveness (valid iff non-null AND its own slot in GObjects
-	   still holds it: catches BOTH collection and slot-reuse, unlike a flags-only deref), plus a class check
-	   when T != UObject. ONE template branches via `if constexpr`: T == UObject → liveness only; else → liveness
-	   AND `Object->IsA(T)`, so `IsValid<APawn>(anyUObjectPtr)` = "live AND an APawn" (a Cast<T> with a liveness
-	   guard; the param stays const UObject* so a BASE pointer is class-checkable). The liveness helper lives in
-	   Basic.cpp because it needs the full UObject (only forward-declared here); `T::StaticClass()` is dependent
-	   so the else branch is instantiated only when reached. NOTE: reads Object->Index, so a wild pointer is on
-	   the caller — for an unowned handle, hold a TWeakObjectPtr. */
+	/* Robust IsValid<T = UObject> — the "ultimate" validity: non-null AND GObjects slot-identity (its own
+	   slot still holds it: catches collection AND slot-reuse) AND an object-flag check rejecting
+	   BeginDestroyed/MirroredGarbage. The flag check is REQUIRED, not cosmetic: a mid-teardown object still
+	   occupies its slot (passes identity) but a virtual call on it jumps through a trashed vtable → crash.
+	   Plus a class check when T != UObject. ONE template branches via `if constexpr`: T == UObject → identity
+	   +flags; else → +`Object->IsA(T)`, so `IsValid<APawn>(anyUObjectPtr)` = "valid AND an APawn" (the param
+	   stays const UObject* so a BASE pointer is class-checkable). The helper lives in Basic.cpp because it needs
+	   the full UObject (only forward-declared here); `T::StaticClass()` is dependent so the else branch is
+	   instantiated only when reached. NOTE: reads Object->Index/Flags, so a wild pointer is on the caller —
+	   for an unowned handle, hold a TWeakObjectPtr. */
 	BasicCpp <<
 		R"(
 bool IsValidOfClass(const class UObject* Object, class UClass* Class)
@@ -6246,6 +6258,11 @@ bool IsValidOfClass(const class UObject* Object, class UClass* Class)
 		return false;
 
 	if (UObject::GObjects->GetByIndex(Object->Index) != Object)
+		return false;
+
+	// Reject mid-teardown / garbage objects: they still occupy their GObjects slot (pass the
+	// identity check above) but a virtual call on them jumps through a trashed vtable -> crash.
+	if (((uint32)Object->Flags & ((uint32)EObjectFlags::BeginDestroyed | (uint32)EObjectFlags::MirroredGarbage)) != 0)
 		return false;
 
 	return !Class || Object->IsA(Class);

@@ -149,7 +149,7 @@ uintptr_t Architecture_x86_64::FindFunctionEnd(const uintptr_t Address, uint32_t
 	if (Range > 0xFFFF)
 		Range = 0xFFFF;
 
-	for (int i = 0; i < Range; i++)
+	for (uint32_t i = 0; i < Range; i++)
 	{
 		if (IsFunctionRet(Address + i))
 			return Address + i;

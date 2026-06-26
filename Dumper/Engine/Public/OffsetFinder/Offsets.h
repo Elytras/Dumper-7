@@ -162,6 +162,22 @@ namespace Off
 			void InitAllocateSerialNumber();
 		}
 
+		namespace TypeHash
+		{
+			// Engine hash functions the emitted SDK GetTypeHash calls at runtime. The int/ptr/FName/float
+			// mixes are constexpr in the SDK (no offset needed); only these RVA-resolved functions are found
+			// here. All module-relative; 0 if not found (that path then falls back to a loud abort tier).
+			//   Strihash   : FCrc::Strihash_DEPRECATED(int Len, const wchar_t*) — FString's case-insensitive
+			//                GetTypeHash on BOTH engines (DRG 0x859440 / RC 0x11B1420). Calling it avoids
+			//                needing the CRCTable_DEPRECATED address (the function reads its own table).
+			//   MemCrc32   : FCrc::MemCrc32(data, len, crc) — UE4.27 default struct memhash (DRG).
+			//   CityHash64 : UE5 default struct memhash (RC; low 32 bits used). DRG also exports it.
+			inline int32 StrihashOffset = 0x0;
+			inline int32 MemCrc32Offset = 0x0;
+			inline int32 CityHash64Offset = 0x0;
+			void InitTypeHashFunctions();
+		}
+
 		namespace ULevel
 		{
 			inline int32 Actors;

@@ -203,6 +203,12 @@ R"(
 
 		/* Whether FUObjectArray::AllocateSerialNumber was located (TWeakObjectPtr construction) */
 		inline bool bHasAllocateSerialNumber = false;
+
+		/* Hash primitives for the emitted GetTypeHash (FString / struct memhash). The constexpr int/ptr/
+		   FName/float mixes need no offset; only these RVA-resolved engine functions do. */
+		inline bool bHasStrihash = false;     // FCrc::Strihash_DEPRECATED  (FString GetTypeHash, both engines)
+		inline bool bHasMemCrc32 = false;     // FCrc::MemCrc32             (UE4.27 struct memhash, DRG)
+		inline bool bHasCityHash64 = false;   // CityHash64                 (UE5 struct memhash, RC)
 	}
 
 	extern void InitWeakObjectPtrSettings();

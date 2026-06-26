@@ -68,6 +68,7 @@ void Generator::InitEngineCore()
 	Off::InSDK::ScriptVM::InitScriptVM();                    // Pure signature scan; no engine deps
 	Off::InSDK::ScriptContainers::InitScriptContainers();    // Pure signature scan; no engine deps
 	Off::InSDK::WeakObject::InitAllocateSerialNumber();      // Pure signature scan; no engine deps
+	Off::InSDK::TypeHash::InitTypeHashFunctions();           // Pure signature scan; no engine deps (SDK GetTypeHash)
 
 	InitSettings();
 }

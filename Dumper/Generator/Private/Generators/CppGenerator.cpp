@@ -4182,6 +4182,15 @@ void CppGenerator::GenerateBasicCore(StreamType& BasicCoreHpp)
 			"\n\tconstexpr int32 AllocateSerialNumber = 0x{:08X};",
 			max(Off::InSDK::WeakObject::AllocateSerialNumberOffset, 0x0));
 
+	if (Settings::Internal::bHasStrihash || Settings::Internal::bHasMemCrc32 || Settings::Internal::bHasCityHash64)
+		AuxFunctionOffsetsText += std::format(
+			"\n\tconstexpr int32 Strihash             = 0x{:08X};"   // FString GetTypeHash (FCrc::Strihash_DEPRECATED)
+			"\n\tconstexpr int32 MemCrc32             = 0x{:08X};"   // UE4 struct memhash
+			"\n\tconstexpr int32 CityHash64           = 0x{:08X};",  // UE5 struct memhash
+			max(Off::InSDK::TypeHash::StrihashOffset, 0x0),
+			max(Off::InSDK::TypeHash::MemCrc32Offset, 0x0),
+			max(Off::InSDK::TypeHash::CityHash64Offset, 0x0));
+
 	/* Offsets and disclaimer */
 	BasicCoreHpp << std::format(R"(
 /*
@@ -6298,6 +6307,67 @@ public:
 	}
 };
 )";
+
+
+	/* ── Engine-matching GetTypeHash (the Lib_Hash catalogue, now emitted with the SDK) ── pure-C++ per-type
+	   hashes that bucket-match THIS engine's live TMap/TSet. Every formula was verified against this build's
+	   FProperty::GetValueTypeHashImpl (see ida/HASHING). The int/ptr/FName/float/double mixes are constexpr /
+	   engine-stable; FString (Strihash) and the POD-struct memhash (MemCrc32 on UE4 / CityHash64 on UE5) call
+	   the functions the OffsetFinder sig-scanned, gated on their offset being found (else a 0 fallback). The
+	   reflection bridge (hash a key by its FProperty type) stays in the consumer; this gives it the per-type
+	   primitives to call. NOTE: composite/custom-struct keys are out of scope (no generic HashCombine here —
+	   it differs per engine: UE5 golden-ratio vs UE4 Bob-Jenkins). */
+	{
+		const std::string StrihashBody = Settings::Internal::bHasStrihash
+			? "{ const int32 Len = Str.Num() - 1; if (Len <= 0) return 0u; return static_cast<uint32>(reinterpret_cast<int(*)(int, const wchar_t*)>(InSDKUtils::GetImageBase() + Offsets::Strihash)(Len, Str.CStr())); }"
+			: "{ (void)Str; return 0u; /* FCrc::Strihash_DEPRECATED not resolved for this build */ }";
+
+		std::string ByteHashBody;
+		if (Settings::Internal::bHasMemCrc32)
+			ByteHashBody = "{ return reinterpret_cast<uint32(*)(const void*, int32, uint32)>(InSDKUtils::GetImageBase() + Offsets::MemCrc32)(Data, Len, 0u); }";
+		else if (Settings::Internal::bHasCityHash64)
+			ByteHashBody = "{ return static_cast<uint32>(reinterpret_cast<unsigned long long(*)(const void*, unsigned long long)>(InSDKUtils::GetImageBase() + Offsets::CityHash64)(Data, static_cast<unsigned long long>(Len))); }";
+		else
+			ByteHashBody = "{ (void)Data; (void)Len; return 0u; /* no struct memhash (MemCrc32/CityHash64) resolved */ }";
+
+		BasicHpp << R"(
+namespace InSDKUtils { uintptr_t GetImageBase(); }
+
+namespace TypeHash
+{
+	// int <= 32b = identity; (u)int64 = lo + 23*hi. [V FProperty::GetValueTypeHashImpl]
+	constexpr uint32 OfU32(uint32 v) { return v; }
+	constexpr uint32 OfI32(int32 v)  { return static_cast<uint32>(v); }
+	constexpr uint32 OfU64(uint64 v) { return static_cast<uint32>(v) + static_cast<uint32>(v >> 32) * 23u; }
+	constexpr uint32 OfI64(int64 v)  { return OfU64(static_cast<uint64>(v)); }
+
+	// float/double: (==0)?0 : the raw bit pattern through the matching int path (folds +-0).
+	inline uint32 OfFloat(float f)   { if (f == 0.0f) return 0u; union { float fv; uint32 uv; } c; c.fv = f; return c.uv; }
+	inline uint32 OfDouble(double d) { if (d == 0.0)  return 0u; union { double dv; uint64 uv; } c; c.dv = d; return OfU64(c.uv); }
+
+	// PointerHash = Murmur3 fmix32 of (ptr>>4). Engine-stable (Templates/TypeHash.h).
+	inline uint32 OfPtr(const void* p)
+	{
+		uint32 x = static_cast<uint32>(reinterpret_cast<uintptr_t>(p) >> 4);
+		x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+		return x;
+	}
+
+	// GetTypeHash(FNameEntryId) — the FName comparison-index mix (NOT identity), + Number.
+	constexpr uint32 OfNameEntryId(uint32 a) { const uint32 lo = a & 0xFFFFu, hi = (a >> 16) & 0xFFFFu; return static_cast<uint32>((lo << 16) + lo + 0x80001u * hi + (lo >> 4)); }
+	inline uint32 OfName(const FName& N) { return OfNameEntryId(static_cast<uint32>(N.ComparisonIndex)) + N.Number; }
+
+	// FWeakObjectPtr = ObjectIndex ^ ObjectSerialNumber.
+	inline uint32 OfWeakObjectPtr(const FWeakObjectPtr& W) { return static_cast<uint32>(W.ObjectIndex ^ W.ObjectSerialNumber); }
+
+	// FString = FCrc::Strihash_DEPRECATED(Num-1, data), case-insensitive (RVA-resolved).
+	inline uint32 OfString(const FString& Str) )" << StrihashBody << R"(
+
+	// POD/default-hash struct = the engine's byte memhash for THIS build (RVA-resolved).
+	inline uint32 OfBytes(const void* Data, int32 Len) )" << ByteHashBody << R"(
+}
+)";
+	}
 
 
 	/* Robust IsValid<T = UObject> — the "ultimate" validity: non-null AND GObjects slot-identity (its own

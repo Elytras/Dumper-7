@@ -774,6 +774,56 @@ void Off::InSDK::WeakObject::InitAllocateSerialNumber()
 #endif
 }
 
+/*
+* Off::InSDK::TypeHash::InitTypeHashFunctions
+*
+* Resolves the engine hash functions the emitted SDK GetTypeHash calls at runtime: FCrc::Strihash_DEPRECATED
+* (FString, both engines), and the struct memhash — FCrc::MemCrc32 (UE4.27) / CityHash64 (UE5). The
+* int/ptr/FName/float mixes are constexpr in the SDK and need no scan. Each is optional (a miss just leaves
+* that path on the loud abort tier). Signatures proven against DRG (UE4.27) + RC (UE5.6).
+*/
+void Off::InSDK::TypeHash::InitTypeHashFunctions()
+{
+#ifdef PLATFORM_WINDOWS
+#if defined(_WIN64)
+	const auto Resolve = [](const char* sig) -> int32
+	{
+		void* Fn = Platform::FindPattern(sig, 0x0, false, 0x0, nullptr);
+		return Fn ? static_cast<int32>(reinterpret_cast<uint8_t*>(Fn) - reinterpret_cast<uint8_t*>(Platform::GetModuleBase())) : 0x0;
+	};
+
+	// FCrc::Strihash_DEPRECATED(int Len, const wchar_t*) — FString's case-insensitive GetTypeHash on BOTH
+	// engines (DRG 0x859440 / RC 0x11B1420). The masked byte is the REX on `mov r10, rdx` (4C vs 49 across
+	// builds); calling the function sidesteps needing the CRCTable_DEPRECATED address (it reads its own table).
+	Off::InSDK::TypeHash::StrihashOffset =
+		Resolve("48 83 EC 08 33 C0 ?? 8B D2 85 C9 7E ?? 48 89 1C 24 48 8D 1D ?? ?? ?? ?? 44 8B D9");
+	Settings::Internal::bHasStrihash = Off::InSDK::TypeHash::StrihashOffset != 0x0;
+
+	// FCrc::MemCrc32(data, len, crc) — UE4.27 default struct memhash (DRG 0x1D1F600). Unused on UE5.
+	Off::InSDK::TypeHash::MemCrc32Offset =
+		Resolve("48 89 5C 24 10 56 44 8D 49 03 8B DA 41 83 E1 FC 48 8D 35 ?? ?? ?? ?? 44 2B C9 4C 8B D9 41 F7 D0");
+	Settings::Internal::bHasMemCrc32 = Off::InSDK::TypeHash::MemCrc32Offset != 0x0;
+
+	// CityHash64 — UE5 default struct memhash (RC 0x1217590; DRG 0x1C6E950 also exports it). One sig per
+	// family (the frame-size immediate / extra pushed reg differ; tail `cmp/ja` length checks are shared).
+	const char* const CityHashSigs[] = {
+		"40 53 57 41 57 48 83 EC ?? 8B DA 48 8B F9 83 FA 20 0F 87 ?? ?? ?? ?? 83 FB 10 0F 87",       // RC / UE5.6
+		"40 53 57 41 56 41 57 48 83 EC 28 8B DA 48 8B F9 83 FA 20 0F 87 ?? ?? ?? ?? 83 FB 10 0F 87", // DRG / UE4.27
+	};
+	for (const char* sig : CityHashSigs)
+	{
+		Off::InSDK::TypeHash::CityHash64Offset = Resolve(sig);
+		if (Off::InSDK::TypeHash::CityHash64Offset)
+			break;
+	}
+	Settings::Internal::bHasCityHash64 = Off::InSDK::TypeHash::CityHash64Offset != 0x0;
+
+	std::cerr << std::format("TypeHash: Strihash=0x{:X} MemCrc32=0x{:X} CityHash64=0x{:X}\n",
+		Off::InSDK::TypeHash::StrihashOffset, Off::InSDK::TypeHash::MemCrc32Offset, Off::InSDK::TypeHash::CityHash64Offset);
+#endif
+#endif
+}
+
 /* UWorld */
 void Off::InSDK::World::InitGWorld()
 {

@@ -4912,6 +4912,17 @@ ClassType* GetDefaultObjImpl()
 		},
 	};
 
+	FUObjectItem.Functions =
+	{
+		PredefinedFunction {
+			.CustomComment = "SerialNumber lives at Object+0x10 (engine FUObjectItem: Object, int32 Flags, int32 ClusterRootIndex, int32 SerialNumber). Used by serial-validated FWeakObjectPtr::Get.",
+			.ReturnType = "inline int32", .NameWithParams = "GetSerialNumber()",
+			.Body = std::format("{{\n\treturn *reinterpret_cast<const int32*>(reinterpret_cast<const uint8*>(this) + 0x{:X});\n}}\n",
+				Off::InSDK::ObjArray::FUObjectItemInitialOffset + 0x10),
+			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
+		},
+	};
+
 	GenerateStruct(&FUObjectItem, BasicHpp, BasicCpp, BasicHpp, AssertionsFile);
 
 	constexpr const char* DefaultDecryption = R"([](void* ObjPtr) -> uint8*
@@ -4986,6 +4997,17 @@ R"({
 		return nullptr;
 
 	return GetDecrytedObjPtr()[Index].Object;
+})",
+				.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
+			},
+			PredefinedFunction {
+				.CustomComment = "Like GetByIndex but returns the FUObjectItem (carries the SerialNumber), for serial-validated weak-pointer resolution.",
+				.ReturnType = "inline FUObjectItem*", .NameWithParams = "GetItemByIndex(const int32 Index)", .Body =
+R"({
+	if (Index < 0 || Index > NumElements)
+		return nullptr;
+
+	return &GetDecrytedObjPtr()[Index];
 })",
 				.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
 			},
@@ -5087,6 +5109,23 @@ R"({
 	if (!ChunkPtr) return nullptr;
 	
 	return ChunkPtr[InChunkIdx].Object;
+})",
+				.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
+			},
+			PredefinedFunction {
+				.CustomComment = "Like GetByIndex but returns the FUObjectItem (carries the SerialNumber), for serial-validated weak-pointer resolution.",
+				.ReturnType = "inline FUObjectItem*", .NameWithParams = "GetItemByIndex(const int32 Index)", .Body =
+R"({
+	const int32 ChunkIndex = Index / ElementsPerChunk;
+	const int32 InChunkIdx = Index % ElementsPerChunk;
+
+	if (Index < 0 || ChunkIndex >= NumChunks || Index >= NumElements)
+	    return nullptr;
+
+	FUObjectItem* ChunkPtr = GetDecrytedObjPtr()[ChunkIndex];
+	if (!ChunkPtr) return nullptr;
+
+	return &ChunkPtr[InChunkIdx];
 })",
 				.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
 			},
@@ -6184,7 +6223,16 @@ R"({
 			.CustomComment = "",
 			.ReturnType = "class UObject*", .NameWithParams = "Get()", .Body =
 R"({
-	return UObject::GObjects->GetByIndex(ObjectIndex);
+	// Serial-validated resolve (engine semantics): a 0 serial is a null/unassigned weak ptr; a serial
+	// mismatch means the slot index was recycled by a DIFFERENT object since this weak ptr was made, so
+	// the original referent is gone. Returns nullptr in both cases instead of a live wrong/dangling
+	// object (ABA-safe), matching UE's FWeakObjectPtr::Get (it ignored the serial before).
+	if (ObjectSerialNumber == 0)
+		return nullptr;
+	FUObjectItem* Item = UObject::GObjects->GetItemByIndex(ObjectIndex);
+	if (!Item || Item->GetSerialNumber() != ObjectSerialNumber)
+		return nullptr;
+	return Item->Object;
 })",
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},
@@ -6192,15 +6240,15 @@ R"({
 			.CustomComment = "",
 			.ReturnType = "class UObject*", .NameWithParams = "operator->()", .Body =
 R"({
-	return UObject::GObjects->GetByIndex(ObjectIndex);
+	return Get();
 })",
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},
 		PredefinedFunction {
-			.CustomComment = "",
+			.CustomComment = "Index AND serial (UE HasSameIndexAndSerialNumber) — consistent with GetTypeHash so a weak ptr can key a TSet/TMap.",
 			.ReturnType = "bool", .NameWithParams = "operator==(const FWeakObjectPtr& Other)", .Body =
 R"({
-	return ObjectIndex == Other.ObjectIndex;
+	return ObjectIndex == Other.ObjectIndex && ObjectSerialNumber == Other.ObjectSerialNumber;
 })",
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},
@@ -6208,7 +6256,7 @@ R"({
 			.CustomComment = "",
 			.ReturnType = "bool", .NameWithParams = "operator!=(const FWeakObjectPtr& Other)", .Body =
 R"({
-	return ObjectIndex != Other.ObjectIndex;
+	return ObjectIndex != Other.ObjectIndex || ObjectSerialNumber != Other.ObjectSerialNumber;
 })",
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
 		},

@@ -6330,6 +6330,31 @@ public:
 		else
 			ByteHashBody = "{ (void)Data; (void)Len; return 0u; /* no struct memhash (MemCrc32/CityHash64) resolved */ }";
 
+		/* PointerHash of (ptr>>4) is a PER-ENGINE seam (NOT the "engine-stable" myth): live bucket-matching
+		   real TMap<UObject*,*> proved UE4 uses the Bob-Jenkins lookup3 mix (golden-ratio 0x9E3779B9) while
+		   UE5 uses the Murmur3 fmix32. Keyed off bHasMemCrc32 — the same UE4(MemCrc32)/UE5(CityHash64) family
+		   split as OfBytes (the two hashers move together: UE4 = MemCrc32 + Jenkins, UE5 = CityHash64 + Murmur).
+		   See ida/HASHING. Only low 32 bits of (ptr>>4) feed the mix on both (the engine truncates). */
+		const std::string PtrHashBody = Settings::Internal::bHasMemCrc32
+			? R"({
+		// UE4 Bob-Jenkins lookup3 final mix of (low32 of ptr>>4).
+		const uint32 v = static_cast<uint32>(reinterpret_cast<uintptr_t>(p) >> 4);
+		const uint32 v3 = (v << 8)  ^ (0x9E3779B9u - v);
+		const uint32 v4 = (v3 >> 13) ^ (0u - (v3 + v));
+		const uint32 a  = (v4 >> 12) ^ (v  - v3 - v4);
+		const uint32 v5 = (a << 16) ^ (v3 - a  - v4);
+		const uint32 v6 = (v5 >> 5)  ^ (v4 - v5 - a);
+		const uint32 b  = (v6 >> 3)  ^ (a  - v5 - v6);
+		const uint32 t  = (b << 10) ^ (v5 - b  - v6);
+		return (t >> 15) ^ (v6 - t - b);
+	})"
+			: R"({
+		// UE5 Murmur3 fmix32 of (low32 of ptr>>4).
+		uint32 x = static_cast<uint32>(reinterpret_cast<uintptr_t>(p) >> 4);
+		x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+		return x;
+	})";
+
 		BasicHpp << R"(
 namespace InSDKUtils { uintptr_t GetImageBase(); }
 
@@ -6345,13 +6370,8 @@ namespace TypeHash
 	inline uint32 OfFloat(float f)   { if (f == 0.0f) return 0u; union { float fv; uint32 uv; } c; c.fv = f; return c.uv; }
 	inline uint32 OfDouble(double d) { if (d == 0.0)  return 0u; union { double dv; uint64 uv; } c; c.dv = d; return OfU64(c.uv); }
 
-	// PointerHash = Murmur3 fmix32 of (ptr>>4). Engine-stable (Templates/TypeHash.h).
-	inline uint32 OfPtr(const void* p)
-	{
-		uint32 x = static_cast<uint32>(reinterpret_cast<uintptr_t>(p) >> 4);
-		x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
-		return x;
-	}
+	// PointerHash of (ptr>>4) — PER-ENGINE (UE4 Bob-Jenkins lookup3 / UE5 Murmur3 fmix32), verified live; see ida/HASHING.
+	inline uint32 OfPtr(const void* p) )" << PtrHashBody << R"(
 
 	// GetTypeHash(FNameEntryId) — the FName comparison-index mix (NOT identity), + Number.
 	constexpr uint32 OfNameEntryId(uint32 a) { const uint32 lo = a & 0xFFFFu, hi = (a >> 16) & 0xFFFFu; return static_cast<uint32>((lo << 16) + lo + 0x80001u * hi + (lo >> 4)); }

@@ -13,10 +13,12 @@
 #include "Generators/MappingGenerator.h"
 #include "Generators/IDAMappingGenerator.h"
 #include "Generators/DumpspaceGenerator.h"
+#include "Generators/BytecodeGenerator.h"
 
 #include "Generators/Generator.h"
 
 #include "Unreal/ObjectArray.h"
+#include "Unreal/GcKeep.h"
 #include "OffsetFinder/Offsets.h"
 #include "Platform.h"
 
@@ -113,13 +115,13 @@ static void RunFullDump()
 {
 	Generator::InitInternal();
 
-	/* Opt-in: pin every live object with RootSet so GC keeps them -> fuller dumps. Runs here (game thread
-	   parked inside the Tick hook) so GObjects is stable while we OR the flags. "Cursed": the game won't GC
-	   these again afterwards. */
+	/* Opt-in: pin every class's {class, package, CDO} with RootSet so GC never unloads it -> fuller dumps.
+	   Instances of those classes are untouched (game keeps playing/GC'ing normally elsewhere). Runs here
+	   (game thread parked inside the Tick hook) so GObjects is stable while we OR the flags. */
 	if (Settings::Config::bKeepObjectsAliveForDump)
 	{
 		const int32 Flagged = ObjectArray::KeepAllFromGC();
-		std::cerr << std::format("[Dumper-7] KeepObjectsAlive: flagged {} live objects RootSet (GC-keep).\n", Flagged);
+		std::cerr << std::format("[Dumper-7] KeepObjectsAlive: flagged {} class/package/CDO object(s) RootSet (GC-keep).\n", Flagged);
 	}
 
 	if (Settings::Generator::GameName.empty() && Settings::Generator::GameVersion.empty())
@@ -146,6 +148,7 @@ static void RunFullDump()
 	Generator::Generate<MappingGenerator>();
 	Generator::Generate<IDAMappingGenerator>();
 	Generator::Generate<DumpspaceGenerator>();
+	Generator::Generate<BytecodeGenerator>();
 }
 
 /* ---- Game-thread synchronization via a UGameEngine::Tick vtable hook ---- */
@@ -182,28 +185,30 @@ static void RestoreTickHook()
 
 static void TickHook(void* This, float DeltaSeconds, bool bIdleMode)
 {
-	/* KeepObjectsAlive mode: don't dump on tick. Instead keep re-rooting every object (throttled) on the
-	   game thread so newly-loaded assets/levels survive GC while the user roams, and only fall through to
-	   the dump once the dump hotkey is pressed. The hook stays installed (one frame is never "parked") until
-	   then. */
+	/* KeepObjectsAlive mode: don't dump on tick. Instead keep re-rooting newly-seen classes (throttled) on
+	   the game thread so classes pulled in by loading levels/assets survive GC while the user roams, and
+	   only fall through to the dump once the dump hotkey is pressed. Only classes (+ package + CDO) are
+	   pinned - not their instances - so the game plays normally while roaming. The hook stays installed
+	   (one frame is never "parked") until then. */
 	if (Settings::Config::bKeepObjectsAliveForDump)
 	{
-		/* First tick: root EVERY existing object in one full sweep, so nothing the eventual dump will touch
-		   (e.g. an enum used as a function param) can be GC'd during the wait. Deferring the full sweep to
-		   dump time is too late - an object freed mid-wait is already gone and can't be resurrected. This is
-		   the game thread, so GObjects is stable for the sweep. */
+		/* First tick: scan EVERY existing object in one full sweep, rooting each class found (+ its
+		   package + CDO), so no class the eventual dump will touch can be unloaded during the wait.
+		   Deferring the full sweep to dump time is too late - a class freed mid-wait is already gone and
+		   can't be resurrected. This is the game thread, so GObjects is stable for the sweep. */
 		static bool bRootedAll = false;
 		if (!bRootedAll)
 		{
 			const int32 Flagged = ObjectArray::KeepAllFromGC();
-			std::cerr << std::format("[Dumper-7] KeepObjectsAlive: rooted {} existing objects (full sweep); now keeping new ones each tick.\n", Flagged);
+			std::cerr << std::format("[Dumper-7] KeepObjectsAlive: rooted {} class/package/CDO object(s) (full sweep); now keeping new ones each tick.\n", Flagged);
 			bRootedAll = true;
 		}
 		else
 		{
-			/* Incremental forward root: cap work at KeepBatchPerTick items/tick (cheap), marching a
-			   persistent cursor over freshly spawned objects. Already-rooted objects are immortal so their
-			   slots never move/free - we only mark new ones. */
+			/* Incremental forward scan: cap work at KeepBatchPerTick items/tick (cheap), marching a
+			   persistent cursor over freshly spawned objects and rooting any new class (+ package + CDO)
+			   found among them. Already-rooted objects are immortal so their slots never move/free - we
+			   only need to look at new ones. */
 			constexpr int32 KeepBatchPerTick = 10000;
 			ObjectArray::KeepNewFromGC(KeepBatchPerTick);
 		}
@@ -385,6 +390,12 @@ DWORD MainThread(HMODULE Module)
 	   scans are short; the heavy full-array work happens later inside RunFullDump (GC-protected). */
 	Generator::InitEngineCore();
 
+	/* Resolve the real FGCObject-based keep (GObjects is up now) - cheap (one GObjects scan + two
+	   pattern scans), so just always do it; every KeepAllFromGC/KeepNewFromGC call site benefits.
+	   No-op if this build's engine natives don't match a known shape - callers fall back to
+	   RootSet-only in that case. */
+	GcKeep::Init();
+
 	g_DumpStartedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	g_DumpDoneEvent    = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -411,7 +422,7 @@ DWORD MainThread(HMODULE Module)
 				std::cerr << "[Dumper-7] Coexist mode - dumping off-thread (mod keeps the game ticking)...\n";
 				RestoreTickHook();
 				const int32 Flagged = ObjectArray::KeepAllFromGC();
-				std::cerr << std::format("[Dumper-7] Flagged {} live objects RootSet (GC-keep for off-thread dump).\n", Flagged);
+				std::cerr << std::format("[Dumper-7] Flagged {} class/package/CDO object(s) RootSet (GC-keep for off-thread dump).\n", Flagged);
 				RunFullDump();
 			}
 			else
@@ -456,8 +467,15 @@ DWORD MainThread(HMODULE Module)
 
 	while (true)
 	{
-		if (GetAsyncKeyState(VK_F6) & 1)
+		// & 0x8000 (physical down), not & 1 (the "pressed since last call" latch): that latch is
+		// global, so once the game thread is live its per-frame GetAsyncKeyState polling clears it
+		// before this 100ms loop sees it — and F6 silently stops unloading.
+		if (GetAsyncKeyState(VK_F6) & 0x8000)
 		{
+			/* Node vtables live in this module - a GC pass calling one after FreeLibrary unmaps us is a
+			   crash. Unregister every outstanding keep first; no-op if GcKeep was never used/available. */
+			GcKeep::ReleaseAll();
+
 			ShutdownFileLogging();
 
 			fclose(stderr);

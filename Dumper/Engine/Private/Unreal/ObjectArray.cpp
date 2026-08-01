@@ -5,6 +5,7 @@
 #include <filesystem>
 
 #include "Unreal/ObjectArray.h"
+#include "Unreal/GcKeep.h"
 #include "OffsetFinder/Offsets.h"
 #include "Utils.h"
 
@@ -440,9 +441,16 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
 }
 
-/* Shared worker: OR RootSet onto items in [Begin, End). EInternalObjectFlags::RootSet is engine-canonical
+/* Shared worker: OR RootSet onto items in [Begin, End), but ONLY for classes (BPGC) - and for each
+   class, its package (Outer) and its CDO alongside it. EInternalObjectFlags::RootSet is engine-canonical
    (1<<30), stable across UE4.27..UE5; FUObjectItem.Flags lives 8 bytes after the Object pointer
-   (FUObjectItem { UObjectBase* Object; int32 Flags; ... }). Returns the count flagged. */
+   (FUObjectItem { UObjectBase* Object; int32 Flags; ... }).
+
+   Deliberately narrow: rooting every live object (the old behavior) pins the whole world - actors,
+   components, one-shot UI widgets - forever, which is what made the old "KeepObjectsAlive" mode
+   cursed/crash-prone. Rooting only {class, package, CDO} means the class itself never unloads (so a
+   dump run later still finds it) while every instance spawned FROM that class keeps despawning/GC'ing
+   normally - the game plays fine everywhere else. Returns the count of objects newly flagged. */
 int32 ObjectArray::KeepRangeFromGC(int32 Begin, int32 End)
 {
 	if (!ItemAddrByIndex || Begin >= End)
@@ -453,19 +461,52 @@ int32 ObjectArray::KeepRangeFromGC(int32 Begin, int32 End)
 	void* const ObjectsArray = GObjects + Off::FUObjectArray::GetObjectsOffset();
 	int32 Flagged = 0;
 
-	for (int32 i = Begin; i < End; ++i)
+	auto KeepIndex = [&](int32 Index) -> bool
 	{
-		void* const ItemSlot = ItemAddrByIndex(ObjectsArray, i, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk);
+		void* const ItemSlot = ItemAddrByIndex(ObjectsArray, Index, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk);
 		if (!ItemSlot)
-			continue;
+			return false;
 
 		void* const Object = *reinterpret_cast<void**>(ItemSlot);
 		if (!Object)
-			continue;
+			return false;
 
 		uint32* const Flags = reinterpret_cast<uint32*>(reinterpret_cast<uint8_t*>(ItemSlot) + sizeof(void*));
+		if (*Flags & RootSet)
+			return false; // already handled (e.g. shared package/CDO seen via an earlier class)
+
 		*Flags |= RootSet;
-		++Flagged;
+
+		/* The real, unload-proof keep: a genuine FGCObject reference via the engine's own native
+		   Add/RemoveObject (auto-resolved in GcKeep::Init()). RootSet above is kept regardless as a
+		   free belt-and-suspenders GC hint; it's the ONLY protection if GcKeep couldn't resolve this
+		   build's engine natives. */
+		if (GcKeep::IsAvailable())
+			GcKeep::Keep(Object);
+
+		return true;
+	};
+
+	for (int32 i = Begin; i < End; ++i)
+	{
+		UEObject Obj = GetByIndex(i);
+		if (!Obj || !Obj.IsA(EClassCastFlags::Class))
+			continue;
+
+		if (KeepIndex(i))
+			++Flagged;
+
+		if (UEObject Outer = Obj.GetOuter())
+		{
+			if (KeepIndex(Outer.GetIndex()))
+				++Flagged;
+		}
+
+		if (UEObject Cdo = Obj.Cast<UEClass>().GetDefaultObject())
+		{
+			if (KeepIndex(Cdo.GetIndex()))
+				++Flagged;
+		}
 	}
 
 	return Flagged;

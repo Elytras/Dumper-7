@@ -41,7 +41,8 @@ private:
 private:
 	static void InitializeFUObjectItem(uint8_t* FirstItemPtr);
 
-	/* OR EInternalObjectFlags::RootSet onto items in [Begin, End); shared by KeepAllFromGC / KeepNewFromGC. */
+	/* OR EInternalObjectFlags::RootSet onto {class, package, CDO} for every class in [Begin, End);
+	   shared by KeepAllFromGC / KeepNewFromGC. */
 	static int32 KeepRangeFromGC(int32 Begin, int32 End);
 
 public:
@@ -52,11 +53,14 @@ public:
 	static void Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& ObjectArrayLayout = FFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
 	static void Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChunkedFixedUObjectArrayLayout& ObjectArrayLayout = FChunkedFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
 
-	/* Opt-in "cursed" GC-keep: OR EInternalObjectFlags::RootSet (0x40000000) onto live FUObjectItems so the
-	   engine's GC never collects them -> fuller dumps (and force-loaded assets survive to the dump). Pure
-	   memory walk via ItemAddrByIndex; returns the number of items flagged.
+	/* Opt-in GC-keep, scoped to classes: OR EInternalObjectFlags::RootSet (0x40000000) onto every class
+	   (BPGC) found in range, plus that class's package and CDO - nothing else. Instances spawned from the
+	   class are untouched and keep GC'ing/despawning normally, so the game plays fine everywhere else;
+	   only the class itself never unloads. (Rooting literally everything, as this used to, is what made
+	   the old "KeepObjectsAlive" mode cursed.) Pure memory walk via ItemAddrByIndex; returns the number of
+	   objects newly flagged.
 	     KeepAllFromGC()        - full sweep [0, Num()); use for the final pass right before dumping.
-	     KeepNewFromGC(MaxBatch) - incremental: roots [cursor, min(cursor+MaxBatch, Num())) and advances a
+	     KeepNewFromGC(MaxBatch) - incremental: scans [cursor, min(cursor+MaxBatch, Num())) and advances a
 	         persistent forward cursor. Cheap to call every tick - already-rooted objects are immortal so
 	         their slots never move/free, meaning we never need to re-mark them; we only march over freshly
 	         spawned objects (a few skipped is fine). MaxBatch<=0 means "to the end". */

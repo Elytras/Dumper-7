@@ -711,6 +711,12 @@ bool UEStruct::HasMembers() const
 
 EClassCastFlags UEClass::GetCastFlags() const
 {
+	// Same hazard UEObject::IsA guards against, one level down: a null class here reads +0xD8 off null → AV.
+	// Reachable from every unguarded `SomeClass.GetCastFlags()` call site (generators, UEProperty::GetCastFlags).
+	// A null class has no flags.
+	if (!Object) [[unlikely]]
+		return EClassCastFlags::None;
+
 	return *reinterpret_cast<EClassCastFlags*>(Object + Off::UClass::CastFlags);
 }
 

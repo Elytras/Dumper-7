@@ -44,6 +44,9 @@
     <ClCompile Include="Generator\Private\Generators\IDAMappingGenerator.cpp">
       <Filter>Generator\Private\Generators</Filter>
     </ClCompile>
+    <ClCompile Include="Generator\Private\Generators\BytecodeGenerator.cpp">
+      <Filter>Generator\Private\Generators</Filter>
+    </ClCompile>
     <ClCompile Include="Utils\Dumpspace\DSGen.cpp">
       <Filter>Utils\Dumpspace</Filter>
     </ClCompile>
@@ -60,6 +63,9 @@
       <Filter>Engine\Private\Unreal</Filter>
     </ClCompile>
     <ClCompile Include="Engine\Private\Unreal\ObjectArray.cpp">
+      <Filter>Engine\Private\Unreal</Filter>
+    </ClCompile>
+    <ClCompile Include="Engine\Private\Unreal\GcKeep.cpp">
       <Filter>Engine\Private\Unreal</Filter>
     </ClCompile>
     <ClCompile Include="Engine\Private\Unreal\UnrealObjects.cpp">
@@ -201,6 +207,9 @@
     <ClInclude Include="Generator\Public\Generators\IDAMappingGenerator.h">
       <Filter>Generator\Public\Generators</Filter>
     </ClInclude>
+    <ClInclude Include="Generator\Public\Generators\BytecodeGenerator.h">
+      <Filter>Generator\Public\Generators</Filter>
+    </ClInclude>
     <ClInclude Include="Generator\Public\PredefinedMembers.h">
       <Filter>Generator\Public</Filter>
     </ClInclude>
@@ -241,6 +250,9 @@
       <Filter>Engine\Public\Unreal</Filter>
     </ClInclude>
     <ClInclude Include="Engine\Public\Unreal\ObjectArray.h">
+      <Filter>Engine\Public\Unreal</Filter>
+    </ClInclude>
+    <ClInclude Include="Engine\Public\Unreal\GcKeep.h">
       <Filter>Engine\Public\Unreal</Filter>
     </ClInclude>
     <ClInclude Include="Engine\Public\Unreal\UnrealObjects.h">

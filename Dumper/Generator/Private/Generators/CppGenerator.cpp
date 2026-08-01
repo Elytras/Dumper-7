@@ -2998,12 +2998,38 @@ R"({
 })",
 			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
 		},
+		/* NewObject - three overloads. ONLY the FName one defaults its Name (so an omitted-Name call,
+		   e.g. NewObject<T>() / (Outer), binds here unambiguously); the string overloads require
+		   Outer+Class+Name (no defaulted-before-required gap, and they can't compete on omitted-Name
+		   calls). The string overloads forward to the FName one so the native SCO logic lives in one body. */
 		PredefinedFunction {
 			.CustomComment = "Constructs a new object via native StaticConstructObject_Internal (direct call, not ProcessEvent). Class defaults to UEType::StaticClass().",
 			.CustomTemplateText = "template<typename UEType = UObject>",
 			.ReturnType = "UEType*", .NameWithParams = "NewObject(class UObject* Outer = nullptr, class UClass* Class = nullptr, class FName Name = FName(), EObjectFlags Flags = static_cast<EObjectFlags>(0), class UObject* Template = nullptr)",
 			.NameWithParamsWithoutDefaults = "NewObject(class UObject* Outer, class UClass* Class, class FName Name, EObjectFlags Flags, class UObject* Template)",
 			.Body = NewObjectBody,
+			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
+		},
+		PredefinedFunction {
+			.CustomComment = "NewObject overload taking a narrow-string name (forwards to the FName overload).",
+			.CustomTemplateText = "template<typename UEType = UObject>",
+			.ReturnType = "UEType*", .NameWithParams = "NewObject(class UObject* Outer, class UClass* Class, const char* Name, EObjectFlags Flags = static_cast<EObjectFlags>(0), class UObject* Template = nullptr)",
+			.NameWithParamsWithoutDefaults = "NewObject(class UObject* Outer, class UClass* Class, const char* Name, EObjectFlags Flags, class UObject* Template)",
+			.Body =
+R"({
+	return NewObject<UEType>(Outer, Class, FName(Name), Flags, Template);
+})",
+			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
+		},
+		PredefinedFunction {
+			.CustomComment = "NewObject overload taking a wide-string name (forwards to the FName overload).",
+			.CustomTemplateText = "template<typename UEType = UObject>",
+			.ReturnType = "UEType*", .NameWithParams = "NewObject(class UObject* Outer, class UClass* Class, const wchar_t* Name, EObjectFlags Flags = static_cast<EObjectFlags>(0), class UObject* Template = nullptr)",
+			.NameWithParamsWithoutDefaults = "NewObject(class UObject* Outer, class UClass* Class, const wchar_t* Name, EObjectFlags Flags, class UObject* Template)",
+			.Body =
+R"({
+	return NewObject<UEType>(Outer, Class, FName(Name), Flags, Template);
+})",
 			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
 		},
 		PredefinedFunction {

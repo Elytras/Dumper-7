@@ -87,7 +87,7 @@ void EnumManager::InitInternal()
 		if (Obj.HasAnyFlags(EObjectFlags::ClassDefaultObject))
 			continue;
 
-		if (Obj.IsA(EClassCastFlags::Struct))
+		if (!Settings::Internal::bHasUnderlayingTypeInUEnum && Obj.IsA(EClassCastFlags::Struct))
 		{
 			UEStruct ObjAsStruct = Obj.Cast<UEStruct>();
 
@@ -124,13 +124,15 @@ void EnumManager::InitInternal()
 				/* Check if the size of this enums underlaying type is greater than the default size (0x1) */
 				if (Enum)
 				{
-					Info.UnderlyingTypeSize = Property.GetSize();
+					const int32 PropertySize = Property.GetSize();
+					Info.UnderlyingTypeSize = max(Info.UnderlyingTypeSize, PropertySize);
 					continue;
 				}
 
 				if (UnderlayingProperty)
 				{
-					Info.UnderlyingTypeSize = UnderlayingProperty.GetSize();
+					const int32 PropertySize = UnderlayingProperty.GetSize();
+					Info.UnderlyingTypeSize = max(Info.UnderlyingTypeSize, PropertySize);
 					continue;
 				}
 			}
@@ -196,6 +198,13 @@ void EnumManager::InitInternal()
 				}
 
 				NewOrExistingInfo.MemberInfos.push_back(CurrentEnumValueInfo);
+			}
+
+			if (Settings::Internal::bHasUnderlayingTypeInUEnum)
+			{
+				auto [Size, bIsSigned] = ObjAsEnum.GetSizeSignedPair();
+				NewOrExistingInfo.UnderlyingTypeSize = Size;
+				NewOrExistingInfo.bIsSigned = bIsSigned;
 			}
 
 			/* Initialize the size based on the highest value contained by this enum */

@@ -24,10 +24,11 @@
 
 enum class EFortToastType : uint8
 {
-        Default                        = 0,
-        Subdued                        = 1,
-        Impactful                      = 2,
-        EFortToastType_MAX             = 3,
+    Default                                  = 0,
+    Subdued                                  = 1,
+    Impactful                                = 2,
+    Lock                                     = 3,
+    EFortToastType_MAX                       = 4,
 };
 
 /* ---- File logging: mirror std::cerr to a log file so the latest log survives a game crash ---- */
@@ -367,22 +368,24 @@ DWORD MainThread(HMODULE Module)
 	FILE* Dummy;
 	freopen_s(&Dummy, "CONOUT$", "w", stderr);
 	freopen_s(&Dummy, "CONIN$", "r", stdin);
+	std::cerr.clear(); // clear internal error flags on cerr after redirect
+	std::cerr << std::boolalpha << std::hex;
 
-	InitFileLogging();
-
-	std::cerr << "Started Generation [Dumper-7]!\n";
+	std::cerr << "Initializing [Dumper-7]\n";
 
 	Settings::Config::Load();
+
+	InitFileLogging();
 
 	if (Settings::Config::bCoexistWithMod)
 		std::cerr << "[Dumper-7] CoexistWithMod ON: running alongside the mod DLL (mod hooks Tick by RVA); "
 		             "off-thread dump fallback disabled.\n";
 
-	if (Settings::Config::SleepTimeout > 0)
-	{
-		std::cerr << "Sleeping for " << Settings::Config::SleepTimeout << "ms...\n";
-		Sleep(Settings::Config::SleepTimeout);
-	}
+	/* Gates the start on SleepTimeout and/or DumpKey (upstream). Note this is the *start* gate;
+	   KeepObjectsAlive mode additionally waits on DumpHotkey inside the Tick hook. */
+	Settings::Config::DelayDumperStart();
+
+	std::cerr << "Started Generation [Dumper-7]!\n";
 
 	auto DumpStartTime = std::chrono::high_resolution_clock::now();
 
@@ -465,6 +468,14 @@ DWORD MainThread(HMODULE Module)
 
 	std::cerr << "\n\nGenerating SDK took (" << DumpTime.count() << "ms)\n\n\n";
 
+	if (Settings::Debug::bExecuteSDKTestScript)
+	{
+		/* Executes a python script to test if the SDK compiles correctly. */
+		CppGenerator::ExecuteSDKCompilationTestScript();
+	}
+
+	std::cerr << "\n\nPress F6 to unload\n\n\n";
+
 	while (true)
 	{
 		// & 0x8000 (physical down), not & 1 (the "pressed since last call" latch): that latch is
@@ -479,7 +490,10 @@ DWORD MainThread(HMODULE Module)
 			ShutdownFileLogging();
 
 			fclose(stderr);
-			if (Dummy) fclose(Dummy);
+			if (Dummy) 
+			{
+				fclose(Dummy);
+			}
 			FreeConsole();
 
 			FreeLibraryAndExitThread(Module, 0);

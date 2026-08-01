@@ -1057,7 +1057,12 @@ void Off::Init()
 
 	Off::UStruct::StructBaseChainArray = OffsetFinder::FindStructBaseChainOffset();
 	if (Off::UStruct::StructBaseChainArray != OffsetFinder::OffsetNotFound)
+	{
 		Off::UStruct::NumStructBasesInChainMinusOne = Off::UStruct::StructBaseChainArray + sizeof(void*);
+		/* Same offset, upstream's name for it (consumed by SharedPredefinedMembers/IDAMappingGenerator). One
+		   finder feeds both - upstream's separate FindStructBaseChainOffset duplicate was dropped in the merge. */
+		Off::UStruct::StructBaseChain = Off::UStruct::StructBaseChainArray;
+	}
 	std::cerr << std::format("Off::UStruct::StructBaseChainArray: 0x{:X} (NumStructBasesInChainMinusOne @ 0x{:X})\n",
 		Off::UStruct::StructBaseChainArray, Off::UStruct::NumStructBasesInChainMinusOne);
 
@@ -1091,6 +1096,13 @@ void Off::Init()
 		*/
 		Off::FField::Flags = Off::FField::Name + Off::InSDK::Name::FNameSize;
 		std::cerr << std::format("Off::FField::Flags: 0x{:X}\n", Off::FField::Flags);
+
+		Off::FField::EditorOnlyMetadata = OffsetFinder::FindFFieldEditorOnlyMetaDataOffset();
+		if (Off::FField::EditorOnlyMetadata != OffsetFinder::OffsetNotFound)
+			std::cerr << std::format("Off::FField::EditorOnlyMetadata: 0x{:X}\n", Off::FField::EditorOnlyMetadata);
+
+		Off::FFieldClass::CastFlags = OffsetFinder::FindFieldClassCastFlagsOffset();
+		std::cerr << std::format("Off::FFieldClass::CastFlags: 0x{:X}\n\n", Off::FFieldClass::CastFlags);
 	}
 
 	Off::UClass::ClassDefaultObject = OffsetFinder::FindDefaultObjectOffset();
@@ -1101,6 +1113,11 @@ void Off::Init()
 
 	Off::UEnum::Names = OffsetFinder::FindEnumNamesOffset();
 	std::cerr << std::format("Off::UEnum::Names: 0x{:X}\n", Off::UEnum::Names) << std::endl;
+
+	Off::UEnum::UnderlyingType = OffsetFinder::FindEnumUnderlayingTypeOffset();
+
+	if (Settings::Internal::bHasUnderlayingTypeInUEnum)
+		std::cerr << std::format("Off::UEnum::UnderlyingType: 0x{:X}\n", Off::UEnum::UnderlyingType) << std::endl;
 
 	Off::UFunction::FunctionFlags = OffsetFinder::FindFunctionFlagsOffset();
 	std::cerr << std::format("Off::UFunction::FunctionFlags: 0x{:X}\n", Off::UFunction::FunctionFlags);
@@ -1205,6 +1222,9 @@ void Off::Init()
 	Off::OptionalProperty::ValueProperty = OffsetFinder::FindOptionalPropertyValuePropertyOffset(Off::InSDK::Properties::PropertySize);
 
 	Off::ClassProperty::MetaClass = Off::ObjectProperty::PropertyClass + sizeof(void*); //0x8 inheritance from ObjectProperty
+
+	Off::FInstancedStruct::ScriptStruct = 0x00;
+	Off::FInstancedStruct::StructMemory = Off::FInstancedStruct::ScriptStruct + sizeof(void*);
 }
 
 void PropertySizes::Init()

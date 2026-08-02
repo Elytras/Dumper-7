@@ -8203,13 +8203,21 @@ namespace UC
 		inline const ArrayElementType& GetUnsafe(int32 Index) const { return Data[Index]; }
 
 	public:
-		/* Adds to the array if there is still space for one more element */
+		/* Appends, growing the allocation when it is full. Growth goes through the engine's own
+		   allocator (UERealloc -> FMemory::Realloc), so an array grown here stays something the
+		   engine can free. Returns false only if the reallocation failed.
+
+		   This used to append ONLY into existing slack, returning false otherwise, which made
+		   Clear() followed by Add() a silent no-op: clearing leaves MaxElements alone, and an
+		   array the game handed over full has no slack to append into. */
 		inline bool Add(const ArrayElementType& Element)
 		{
-			if (GetSlack() <= 0)
+			if (NumElements >= MaxElements)
+				Reserve(NumElements + 1);
+			if (NumElements >= MaxElements)
 				return false;
 
-			Data[NumElements] = Element;
+			new (&Data[NumElements]) ArrayElementType(Element);
 			NumElements++;
 
 			return true;
@@ -8231,12 +8239,14 @@ namespace UC
 			return true;
 		}
 
+		/* Zero the live elements and drop the count, keeping the allocation. The memset used to run
+		   AFTER NumElements was zeroed, so it always cleared 0 bytes and the old contents stayed. */
 		inline void Clear()
 		{
-			NumElements = 0;
-
 			if (Data)
-				memset(Data, 0, NumElements * ElementSize);
+				memset(Data, 0, static_cast<size_t>(NumElements) * ElementSize);
+
+			NumElements = 0;
 		}
 
     public:
@@ -8335,14 +8345,8 @@ namespace UC
             MaxElements = NewMax;
         }
 
-        bool AddGrow(const ArrayElementType& Element)
-        {
-            if (NumElements >= MaxElements) Reserve(NumElements + 1);
-            if (NumElements >= MaxElements) return false;
-            new (&Data[NumElements]) ArrayElementType(Element);
-            ++NumElements;
-            return true;
-        }
+        /* The old name for Add, from when Add could not grow. Kept so existing code keeps building. */
+        bool AddGrow(const ArrayElementType& Element) { return Add(Element); }
 
         void SetNum(int32 NewNum)
         {

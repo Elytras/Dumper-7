@@ -280,12 +280,16 @@ namespace UC
 			return true;
 		}
 
+		/* Zero the live elements and drop the count. Was doubly wrong: it memset only when Data was
+		   NULL, and it zeroed NumElements first so the length was 0 by the time it was used.
+		   (Add is deliberately left non-growing here — the dumper reads the game's arrays, it does
+		   not own them.) */
 		inline void Clear()
 		{
-			NumElements = 0;
+			if (Data)
+				memset(Data, 0, static_cast<size_t>(NumElements) * ElementSize);
 
-			if (!Data)
-				memset(Data, 0, NumElements * ElementSize);
+			NumElements = 0;
 		}
 
 	public:

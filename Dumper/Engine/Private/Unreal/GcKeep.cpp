@@ -1,3 +1,4 @@
+#include <atomic>
 #include <iostream>
 #include <format>
 #include <mutex>
@@ -11,23 +12,76 @@
 
 namespace GcKeep
 {
-	/* ABI mirror of FReferenceCollector - declares the virtuals in the EXACT engine order so the
-	   compiler emits HandleObjectReference at slot 7 (we never instantiate this; we reinterpret the
-	   collector the engine hands us each AddReferencedObjects call). Pointer-only signature (void*
-	   instead of the real UObject / FProperty pointer types) - we don't have (or need) those struct
-	   layouts, only the calling convention, which is identical either way. */
-	class FReferenceCollector
+	/* ---- FReferenceCollector ABI mirrors -------------------------------------------------------------
+	   We never instantiate these. We reinterpret the collector the engine hands us and call exactly ONE
+	   virtual, so the only thing that has to be right is the SLOT INDEX of HandleObjectReference.
+
+	   That index is NOT stable across engine generations, and getting it wrong is completely silent on
+	   x64: the Microsoft ABI is caller-cleanup with the first four arguments in volatile registers, so a
+	   call that lands on a neighbouring virtual just reads RCX, ignores the rest, and returns. No crash,
+	   no stack imbalance, nothing reported to the collector - the keep degrades to a no-op that still
+	   logs success. (On x86 the same mistake would corrupt the stack via __thiscall's callee-cleanup
+	   `ret N`, which is at least loud. Keep that in mind if a 32-bit target is ever wired up.)
+
+	   Slots verified against the engine headers:
+	     UE4.27 CoreUObject/Public/UObject/UObjectGlobals.h - HandleObjectReference is slot 7
+	     UE5.6  CoreUObject/Public/UObject/UObjectGlobals.h - slot 17; six AddStableReference* overloads
+	            plus NeedsPropertyReferencer / SetIsProcessingNativeReferences /
+	            IsProcessingNativeReferences / NeedsInitialReferences were inserted ahead of it.
+	   Declaration order is vtable order. MSVC emits same-name overloads in reverse within their group,
+	   which permutes indices INSIDE a group but never changes how many entries precede a uniquely-named
+	   virtual, so the arithmetic holds regardless. Signatures are pointer-only (void* for UObject /
+	   FProperty) - we need the calling convention, not the layouts.
+
+	   Which mirror applies is not guessed: the FGCObject registration ABI resolved in Init() already
+	   identifies the engine generation (V1_TwoArg = UE4-era, V2_OneArg = UE5-era), so each node type
+	   below is hard-wired to its matching collector shape. */
+
+	/* Distinct opaque stand-ins so the overload SETS match the engine's shape (TObjectPtr<UObject>*,
+	   TArray<...>*, TSet<...>* etc). Never defined - only ever used as pointer parameter types. */
+	struct FOpaqueObjectPtr;
+	struct FOpaqueObjectPtrArray;
+	struct FOpaqueObjectPtrSet;
+	struct FOpaqueObjectArray;
+	struct FOpaqueObjectSet;
+
+	/* UE4-era layout (validated on UE4.27). HandleObjectReference == slot 7. */
+	class FReferenceCollectorUE4
 	{
 	public:
-		virtual ~FReferenceCollector() {}
-		virtual bool  IsIgnoringArchetypeRef() const { return false; }
-		virtual bool  IsIgnoringTransient() const { return false; }
-		virtual void  AllowEliminatingReferences(bool) {}
-		virtual void  SetSerializedProperty(void*) {}
-		virtual void* GetSerializedProperty() const { return nullptr; }
-		virtual bool  MarkWeakObjectReferenceForClearing(void**) { return false; }
-		virtual void  HandleObjectReference(void*& Object, const void* RefObj, const void* RefProp) = 0;
-		virtual void  HandleObjectReferences(void**, int32, const void*, const void*) {}
+		virtual ~FReferenceCollectorUE4() {}                                        // 0
+		virtual bool  IsIgnoringArchetypeRef() const { return false; }              // 1
+		virtual bool  IsIgnoringTransient() const { return false; }                 // 2
+		virtual void  AllowEliminatingReferences(bool) {}                           // 3
+		virtual void  SetSerializedProperty(void*) {}                               // 4
+		virtual void* GetSerializedProperty() const { return nullptr; }             // 5
+		virtual bool  MarkWeakObjectReferenceForClearing(void**) { return false; }  // 6
+		virtual void  HandleObjectReference(void*& Object, const void* RefObj, const void* RefProp) = 0; // 7
+		virtual void  HandleObjectReferences(void**, int32, const void*, const void*) {}                 // 8
+	};
+
+	/* UE5-era layout (validated on UE5.6). HandleObjectReference == slot 17. */
+	class FReferenceCollectorUE5
+	{
+	public:
+		virtual ~FReferenceCollectorUE5() {}                                        // 0
+		virtual void  AddStableReference(FOpaqueObjectPtr*) {}                      // 1..6 (one overload
+		virtual void  AddStableReferenceArray(FOpaqueObjectPtrArray*) {}            //  set per name; MSVC
+		virtual void  AddStableReferenceSet(FOpaqueObjectPtrSet*) {}                //  may reverse within
+		virtual void  AddStableReference(void**) {}                                 //  a name, count is
+		virtual void  AddStableReferenceArray(FOpaqueObjectArray*) {}               //  what matters)
+		virtual void  AddStableReferenceSet(FOpaqueObjectSet*) {}                   //
+		virtual bool  NeedsPropertyReferencer() const { return true; }              // 7
+		virtual bool  IsIgnoringArchetypeRef() const { return false; }              // 8
+		virtual bool  IsIgnoringTransient() const { return false; }                 // 9
+		virtual void  AllowEliminatingReferences(bool) {}                           // 10
+		virtual void  SetSerializedProperty(void*) {}                               // 11
+		virtual void* GetSerializedProperty() const { return nullptr; }             // 12
+		virtual bool  MarkWeakObjectReferenceForClearing(void**, void*) { return false; } // 13 (gained an arg in UE5)
+		virtual void  SetIsProcessingNativeReferences(bool) {}                      // 14
+		virtual bool  IsProcessingNativeReferences() const { return true; }         // 15
+		virtual bool  NeedsInitialReferences() const { return true; }               // 16
+		virtual void  HandleObjectReference(void*& Object, const void* RefObj, const void* RefProp) = 0; // 17
 	};
 
 	/* Stand-in for a by-value FString return (TArray<TCHAR>: Data ptr + Num + Max on every engine
@@ -40,6 +94,22 @@ namespace GcKeep
 		int32 Max = 0;
 	};
 
+	/* Proof-of-life counters. The failure this code shipped with was invisible precisely because
+	   registration succeeded and the callback fired - only the reported reference went nowhere. These
+	   make the end-to-end path measurable (see GcKeep::Stats, logged at dump time): AroCalls == 0 after
+	   a GC means registration is broken; AroCalls > 0 with objects still dying means the collector slot
+	   is wrong again. Plain counters, no I/O - this runs inside a GC pass. */
+	namespace detail
+	{
+		inline std::atomic<uint64_t> AroCalls{ 0 };
+		inline std::atomic<uint64_t> ObjectsReported{ 0 };
+	}
+
+	/* FGCObject vtable (identical on UE4.27 and UE5.6):
+	     0 ~FGCObject | 1 AddReferencedObjects | 2 GetReferencerName | 3 GetReferencerPropertyName
+	   All four are declared so a call into slot 3 lands on a real function instead of running off the
+	   end of our vtable. */
+
 	/* V1 (UE4-era) node: {vtable; Kept}. UGCObjectReferencer::AddObject stores the node pointer itself
 	   into its array, so all we need to report is the kept object. */
 	struct NodeV1
@@ -47,13 +117,19 @@ namespace GcKeep
 		void* Kept = nullptr;
 		explicit NodeV1(void* InKept) : Kept(InKept) {}
 		virtual ~NodeV1() {}
-		virtual void AddReferencedObjects(FReferenceCollector& Collector)
+		virtual void AddReferencedObjects(FReferenceCollectorUE4& Collector)
 		{
+			detail::AroCalls.fetch_add(1, std::memory_order_relaxed);
+
 			void* Obj = Kept;
 			if (Obj)
+			{
 				Collector.HandleObjectReference(Obj, nullptr, nullptr);
+				detail::ObjectsReported.fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 		virtual DummyFString GetReferencerName() const { return DummyFString{}; }
+		virtual bool GetReferencerPropertyName(void*, DummyFString&) const { return false; }
 	};
 
 	/* V2 (UE5-era) node: FGCObject itself now carries {bWeak; bReferenceAdded} right after the vtable -
@@ -67,13 +143,19 @@ namespace GcKeep
 		void* Kept = nullptr;
 		explicit NodeV2(void* InKept) : Kept(InKept) {}
 		virtual ~NodeV2() {}
-		virtual void AddReferencedObjects(FReferenceCollector& Collector)
+		virtual void AddReferencedObjects(FReferenceCollectorUE5& Collector)
 		{
+			detail::AroCalls.fetch_add(1, std::memory_order_relaxed);
+
 			void* Obj = Kept;
 			if (Obj)
+			{
 				Collector.HandleObjectReference(Obj, nullptr, nullptr);
+				detail::ObjectsReported.fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 		virtual DummyFString GetReferencerName() const { return DummyFString{}; }
+		virtual bool GetReferencerPropertyName(void*, DummyFString&) const { return false; }
 	};
 
 	namespace detail
@@ -129,6 +211,18 @@ namespace GcKeep
 	bool IsAvailable()
 	{
 		return detail::Abi != detail::EAbi::None;
+	}
+
+	FStats Stats()
+	{
+		FStats S;
+		S.AroCalls = detail::AroCalls.load(std::memory_order_relaxed);
+		S.ObjectsReported = detail::ObjectsReported.load(std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> Lock(detail::Mx());
+			S.LiveNodes = detail::Registry().size();
+		}
+		return S;
 	}
 
 	void Init()

@@ -123,6 +123,16 @@ static void RunFullDump()
 	{
 		const int32 Flagged = ObjectArray::KeepAllFromGC();
 		std::cerr << std::format("[Dumper-7] KeepObjectsAlive: flagged {} class/package/CDO object(s) RootSet (GC-keep).\n", Flagged);
+
+		/* Proof-of-life for the FGCObject path. AroCalls==0 after the game has run a GC means our nodes
+		   never reached the referencer; AroCalls>0 while classes still vanish means the collector slot is
+		   wrong for this engine build (see the mirrors in GcKeep.cpp). */
+		if (GcKeep::IsAvailable())
+		{
+			const GcKeep::FStats S = GcKeep::Stats();
+			std::cerr << std::format("[Dumper-7] GcKeep: {} live node(s), {} AddReferencedObjects call(s), {} reference(s) reported.\n",
+				S.LiveNodes, S.AroCalls, S.ObjectsReported);
+		}
 	}
 
 	if (Settings::Generator::GameName.empty() && Settings::Generator::GameVersion.empty())

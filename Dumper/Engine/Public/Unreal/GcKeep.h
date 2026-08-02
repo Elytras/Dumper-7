@@ -37,6 +37,20 @@ namespace GcKeep
 	/* Whether Init() found a usable native keep path for this build. */
 	bool IsAvailable();
 
+	/* Proof-of-life for the keep path, logged at dump time. Registration succeeding proves nothing on its
+	   own - the UE5 collector-slot bug this code shipped with registered fine and fired the callback, and
+	   only the reported reference went nowhere. Read it as:
+	     AroCalls == 0 after a GC has run  -> registration is broken (node never reached the referencer)
+	     AroCalls > 0 but classes still die -> the reference is landing on the wrong collector slot again */
+	struct FStats
+	{
+		uint64_t AroCalls = 0;        // times the engine invoked one of our AddReferencedObjects
+		uint64_t ObjectsReported = 0; // references handed to the collector
+		size_t   LiveNodes = 0;       // registered, not yet released
+	};
+
+	FStats Stats();
+
 	/* Keep `Object` (a raw UObject address) alive until Release(handle). Returns an opaque handle, or
 	   nullptr if unavailable / Object is null. Game thread. */
 	void* Keep(void* Object);

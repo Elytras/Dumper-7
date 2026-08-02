@@ -527,17 +527,25 @@ int32 ObjectArray::KeepAllFromGC()
 
 int32 ObjectArray::KeepNewFromGC(int32 MaxBatch)
 {
-	/* Forward-only cursor: rooted objects are immortal (RootSet stops GC), so their slots never free or
-	   relocate - we never need to re-visit marked indices, only march over freshly spawned ones. */
+	/* WRAPPING cursor, not forward-only. A forward-only sweep looks correct at first glance ("kept objects
+	   are immortal, so their slots never free") but that only holds for the kept ones - which are a tiny
+	   minority. Every unkept object that dies frees its slot, and GObjects RECYCLES those slots, so a class
+	   loaded after the cursor has passed can land at an index BELOW it and never be visited again. That is
+	   silent: the class simply never gets kept, and dies at the next level transition.
+	   Wrapping fixes it for free - already-kept slots bail out on the RootSet test in KeepRangeFromGC, so a
+	   full lap costs little beyond the flag reads, and MaxBatch still caps per-tick work. */
 	static int32 Cursor = 0;
 
 	const int32 N = Num();
+	if (N <= 0)
+		return 0;
+
 	if (Cursor >= N)
-		return 0; // caught up; nothing new this tick
+		Cursor = 0;
 
 	const int32 End = (MaxBatch > 0) ? min(Cursor + MaxBatch, N) : N;
 	const int32 Flagged = KeepRangeFromGC(Cursor, End);
-	Cursor = End;
+	Cursor = (End >= N) ? 0 : End; // wrap instead of parking at the end
 	return Flagged;
 }
 

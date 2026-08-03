@@ -8449,6 +8449,15 @@ namespace UC
 			return L"";
 		}
 
+)";
+
+	/* These two are the only FString members that touch the allocator, so they can only exist when a
+	   GMalloc was resolved. Emitting them unconditionally produced an SDK that referenced
+	   Internal::UEFree / UEMalloc without the namespace above ever being written -- fine for every
+	   target so far, but a compile error the first time GMalloc is not found. */
+	if (Settings::Internal::bHasGMalloc)
+	{
+		UEContainersHeader << R"(
 		/* Convert to std::string and immediately release this FString's buffer via FMemory::Free, so an
 		   engine-returned (FMemory-owning) FString can be drained in one step instead of leaking. Only call
 		   this on an OWNING FString (e.g. one returned by a reflected getter / FText::ToString) — never on a
@@ -8488,6 +8497,10 @@ namespace UC
 			return MakeOwned(Str.c_str(), static_cast<int32>(Str.size()));
 		}
 
+)";
+	}
+
+	UEContainersHeader << R"(
 	public:
 		inline       wchar_t* CStr()       { return Data; }
 		inline const wchar_t* CStr() const { return Data; }

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <string>
 #include <stdexcept>
@@ -333,6 +333,21 @@ namespace UC
 			MaxElements = NullTerminatedLength;
 		}
 
+		/* Owning copy from a narrow string (widened as Latin-1; intended for ASCII). Unlike the
+		   const wchar_t* view above this allocates, so free it with FMemory::Free when done. */
+		FString(const char* Str)
+		{
+			int32 Len = 0;
+			while (Str[Len] != '\0')
+				++Len;
+
+			Reserve(Len + 1);
+			for (int32 i = 0; i < Len; ++i)
+				Data[i] = static_cast<wchar_t>(static_cast<unsigned char>(Str[i]));
+			Data[Len] = L'\0';
+			NumElements = Len + 1;
+		}
+
 		FString(wchar_t* Str, int32 Num, int32 Max)
 		{
 			Data = Str;
@@ -357,6 +372,45 @@ namespace UC
 				return std::wstring(Data);
 
 			return L"";
+		}
+
+		/* Convert to std::string and immediately release this FString's buffer via FMemory::Free, so an
+		   engine-returned (FMemory-owning) FString can be drained in one step instead of leaking. Only call
+		   this on an OWNING FString (e.g. one returned by a reflected getter / FText::ToString) — never on a
+		   non-owning view built from FString(const wchar_t*), whose buffer FMemory does not own. */
+		inline std::string ToStringConsume()
+		{
+			std::string Out = ToString();
+			if (Data) { Internal::UEFree(Data); Data = nullptr; }
+			NumElements = 0;
+			MaxElements = 0;
+			return Out;
+		}
+
+		/* Owning FString from wide text. Allocates through FMemory (GMalloc), so the ENGINE can free
+		   the buffer when it destroys a parm frame / struct — the symmetric counterpart to
+		   ToStringConsume(). Use this to WRITE a reflected FString.
+
+		   Why this is a factory and not a copy constructor / assignment: TArray's layout is exactly
+		   Data/NumElements/MaxElements and MUST match the engine's byte for byte (every SDK field is
+		   a cast over game memory), so there is nowhere to record ownership. A deep-copying ctor
+		   without a destructor would leak on every incidental copy (range-for, lambda capture, pass
+		   by value); a destructor would free ENGINE-owned buffers, since a TArray read off a game
+		   object is a VIEW. Ownership therefore has to be explicit at the call site. */
+		static inline FString MakeOwned(const wchar_t* Str, int32 Len)
+		{
+			if (!Str || Len < 0) return FString();
+			const int32 N = Len + 1;                       // include the null terminator
+			auto* Buf = static_cast<wchar_t*>(Internal::UEMalloc(static_cast<uint64>(N) * sizeof(wchar_t), alignof(wchar_t)));
+			if (!Buf) return FString();
+			for (int32 i = 0; i < Len; ++i) Buf[i] = Str[i];
+			Buf[Len] = L'\0';
+			return FString(Buf, N, N);
+		}
+
+		static inline FString MakeOwned(const std::wstring& Str)
+		{
+			return MakeOwned(Str.c_str(), static_cast<int32>(Str.size()));
 		}
 
 	public:

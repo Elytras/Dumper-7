@@ -1,4 +1,4 @@
-#include "Settings.h"
+﻿#include "Settings.h"
 
 #include <Windows.h>
 #include <filesystem>

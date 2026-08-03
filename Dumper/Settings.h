@@ -2,6 +2,12 @@
 
 #include <string>
 
+/* For the VK_* constants used by the hotkey defaults below. Plain include, deliberately: this
+   header is pulled in very widely, and the tree leans on windows.h's max()/min() MACROS in several
+   places (CppGenerator, ObjectArray, OffsetFinder), so defining NOMINMAX here breaks them. Likewise
+   no WIN32_LEAN_AND_MEAN, which would quietly change what every downstream <Windows.h> provides. */
+#include <Windows.h>
+
 #include "Unreal/Enums.h"
 
 namespace Settings
@@ -32,9 +38,11 @@ namespace Settings
 		   in some games (leaving the dumper stuck) - opt in via the INI once that's reliable. */
 		inline bool bKeepObjectsAliveForDump = false;
 
-		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode (default 0x79 = VK_F10).
-		   Dumper-7.ini [Settings] DumpHotkey=0x79 (decimal or 0x-hex). */
-		inline int DumpHotkey = 0x79;
+		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode.
+		   Named rather than a bare 0x79 so the default is readable where it is declared.
+		   Dumper-7.ini [Settings] DumpHotkey=0x79 overrides it (decimal or 0x-hex — the INI stays
+		   numeric because that is what GetAsyncKeyState takes). */
+		inline int DumpHotkey = VK_F10;
 
 		/* Opt-in: run alongside the mod DLL, which also hooks UGameEngine::Tick. The mod hooks the real
 		   Tick by RVA, so the two coexist (engine -> d7 vtable hook -> g_OriginalTick by RVA -> mod's

@@ -1,4 +1,4 @@
-#include <fstream>
+﻿#include <fstream>
 #include <format>
 
 #include "Generators/BytecodeGenerator.h"
@@ -158,6 +158,20 @@ std::string BytecodeGenerator::ObjName(void* Ptr)
     return UEObject(Ptr).GetFullName();
 }
 
+/* The guarded deref, split into two functions on purpose: __try/__except cannot live in a
+   function that needs C++ unwinding (MSVC C2712), so the SEH frame below holds no objects with
+   destructors and the std::string work happens in the callee. */
+static void BcGetFieldNameRaw(void* Ptr, void* OutStr)
+{
+    *static_cast<std::string*>(OutStr) = UEFField(Ptr).GetName();
+}
+
+static bool BcSehInvoke(void (*Fn)(void*, void*), void* A, void* B)
+{
+    __try { Fn(A, B); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 std::string BytecodeGenerator::FieldName(void* Ptr)
 {
     if (!Ptr)
@@ -166,7 +180,19 @@ std::string BytecodeGenerator::FieldName(void* Ptr)
     if (reinterpret_cast<uintptr_t>(Ptr) & 0x7)
         return std::format("0x{:X}", reinterpret_cast<uintptr_t>(Ptr));
 
-    return UEFField(Ptr).GetName();
+    /* Null and misalignment are cheap to reject, but a DESYNCED walk produces pointers that are
+       neither: ReadPtr() lands on the wrong 8 bytes of script and yields a value that is non-null
+       and 8-aligned yet points at nothing. Dereferencing it walks into FName::AppendString and
+       takes the process down mid-dump (observed: AV reading null+0x288 from EX_ArrayConst).
+
+       A dumper walking bytecode it may have misparsed should degrade to a placeholder, not die, so
+       the rest of the SDK still gets written. A fault also means we are almost certainly desynced,
+       so the operand is reported as a raw address rather than silently looking like a real name. */
+    std::string Name;
+    if (!BcSehInvoke(&BcGetFieldNameRaw, Ptr, &Name))
+        return std::format("<unreadable 0x{:X}>", reinterpret_cast<uintptr_t>(Ptr));
+
+    return Name;
 }
 
 bool BytecodeGenerator::FWalker::Want(int32 N)

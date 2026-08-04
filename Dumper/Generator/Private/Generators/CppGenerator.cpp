@@ -6306,18 +6306,27 @@ R"({
 
 	/* Build a TWeakObjectPtr for any UObject: ObjectIndex = Obj->Index (InternalIndex), ObjectSerialNumber =
 	   FUObjectArray::AllocateSerialNumber(GUObjectArray, Index) when its offset resolved, else a loud abort.
-	   NOTE: the GUObjectArray base is taken as UObject::GObjects (the FUObjectArray the SDK already drives -
-	   NumElements@0x24/Objects@0x10/MasterSerialNumber@0xB0); verify this base on first use. */
+
+	   The `this` AllocateSerialNumber wants is the OUTER FUObjectArray, which is NOT what GObjects holds:
+	   GObjects is found by scanning for contents matching a UObject-array layout, and what matches is the
+	   ObjObjects member, so GObjects points INTO the FUObjectArray. Handing it over unadjusted makes the
+	   native read NumElements off the wrong field and access-violate on null+0x10 — so step back by
+	   ObjObjects' offset within FUObjectArray to recover the real base. */
 	const std::string FromObjectBody = SelectTierBody({
-		{ Settings::Internal::bHasAllocateSerialNumber, R"({
-	FWeakObjectPtr Result{};
+		{ Settings::Internal::bHasAllocateSerialNumber, std::format(R"({{
+	FWeakObjectPtr Result{{}};
 	if (!Object)
 		return Result;
 	Result.ObjectIndex = Object->Index;
+	// GObjects is FUObjectArray::ObjObjects, not the FUObjectArray itself - rewind to the outer struct,
+	// which is the `this` the native expects. Passing GObjects directly AVs on null+0x{:X}.
+	auto* const ObjectArrayBase = reinterpret_cast<void*>(
+		reinterpret_cast<uint8*>(UObject::GObjects.GetTypedPtr()) - 0x{:X});
 	const auto Fn = reinterpret_cast<int32(*)(void*, int32)>(InSDKUtils::GetImageBase() + Offsets::AllocateSerialNumber);
-	Result.ObjectSerialNumber = Fn(UObject::GObjects.GetTypedPtr(), Result.ObjectIndex);
+	Result.ObjectSerialNumber = Fn(ObjectArrayBase, Result.ObjectIndex);
 	return Result;
-})" },
+}})", Off::InSDK::WeakObject::FUObjectArrayObjObjectsOffset,
+      Off::InSDK::WeakObject::FUObjectArrayObjObjectsOffset) },
 	}, R"({
 	(void)Object;
 	InSDKUtils::SdkUnavailable("FWeakObjectPtr::FromObject: FUObjectArray::AllocateSerialNumber was not resolved for this build");

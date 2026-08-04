@@ -159,6 +159,21 @@ namespace Off
 			// build a TWeakObjectPtr for any UObject (ObjectIndex = UObject->InternalIndex; ObjectSerialNumber =
 			// AllocateSerialNumber(...)). Engine-stable index math (FUObjectItem 0x18 stride). Module-relative.
 			inline int32 AllocateSerialNumberOffset = 0x0;
+
+			/* Distance from the OUTER FUObjectArray to its ObjObjects member.
+
+			   Needed because the two are not the same address and AllocateSerialNumber wants the outer one.
+			   GObjects is located by scanning for an address whose CONTENTS match a UObject-array layout, and
+			   the thing that matches is ObjObjects — so Off::InSDK::ObjArray::GObjects, and every GObjects in
+			   the emitted SDK, is the INNER array. Passing that as AllocateSerialNumber's `this` makes it read
+			   NumElements off the wrong field and dereference null+0x10.
+
+			   Engine-stable, hence a constant rather than a scan: FUObjectArray opens with ObjFirstGCIndex,
+			   ObjLastNonGCIndex, MaxObjectsNotConsideredByGC (3x int32) and OpenForDisregardForGC (bool +
+			   3 pad) before ObjObjects — 0x10 on UE4.27 through UE5.x. Re-check if a game ships a modified
+			   FUObjectArray; a wrong value here is a raw call with a bogus `this`, not merely a bad read. */
+			inline constexpr int32 FUObjectArrayObjObjectsOffset = 0x10;
+
 			void InitAllocateSerialNumber();
 		}
 

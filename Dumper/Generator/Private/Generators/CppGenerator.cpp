@@ -2813,12 +2813,13 @@ void CppGenerator::InitPredefinedFunctions()
 
 	PredefinedElements& UObjectPredefs = PredefinedMembers[ObjectArray::FindClassFast("Object").GetIndex()];
 
-	/* UObject is the root class (no super), so GenerateFunctions skips its auto-generated 'StaticClass()'. Provide it here instead.
-	   UObject's object name is "Object" and is unique, so STATIC_CLASS_IMPL (short-name lookup) is correct. XOR-obfuscate the name to match every other class' StaticClass. */
-	const std::string UObjectStaticClassName = Settings::CppGenerator::XORString
-		? std::format("{}(\"Object\")", Settings::CppGenerator::XORString)
-		: "\"Object\"";
-	const std::string UObjectStaticClassBody = std::format("{{\n\tSTATIC_CLASS_IMPL({})\n}}", UObjectStaticClassName);
+	/* NOTE: UObject's StaticClass() is deliberately NOT predefined here. GenerateFunctions emits it
+	   on the auto-generated path -- its guard admits UObject explicitly via IsExactClassUObject() --
+	   and that same path supplies UObject's StaticName()/GetDefaultObj(), so it cannot just be
+	   skipped for UObject. A predefined copy used to sit here too and emitted a byte-identical
+	   SECOND declaration, so the generated SDK failed to compile (C2535: member function already
+	   defined). If you reinstate one, drop IsExactClassUObject() from that guard first and check
+	   StaticName/GetDefaultObj are still emitted for UObject. */
 
 	/* UObject::IsValid() - strongest object-validity this build supports, chosen at generation time:
 	     1. registered-in-GObjects existence + identity (this->Index in range && GObjects[Index] == this) - the engine's
@@ -2911,13 +2912,6 @@ void CppGenerator::InitPredefinedFunctions()
 
 	UObjectPredefs.Functions =
 	{
-		/* static inline functions */
-		PredefinedFunction {
-			.CustomComment = "Used with 'IsA' to check if an object is of a certain type",
-			.ReturnType = "class UClass*", .NameWithParams = "StaticClass()", .Body = UObjectStaticClassBody,
-			.bIsStatic = true, .bIsConst = false, .bIsBodyInline = true
-		},
-
 		/* static non-inline functions */
 		PredefinedFunction {
 			.CustomComment = "Finds a UObject in the global object array by full-name, optionally with ECastFlags to reduce heavy string comparison",

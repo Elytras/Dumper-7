@@ -126,7 +126,12 @@ namespace PackageManagerUtils
 	{
 		if (Prop.IsA(EClassCastFlags::StructProperty))
 		{
-			Store.insert(Prop.Cast<UEStructProperty>().GetUnderlayingStruct().GetIndex());
+			/* Null-checked, like the Enum/Byte branches below already are. A StructProperty can
+			   outlive the UScriptStruct it points at -- force-loading a large asset tree and then
+			   letting GC reclaim the unreferenced Blueprint types leaves exactly that -- and
+			   GetIndex() on a null/dangling struct reads +0xC off nothing. */
+			if (UEStruct Underlaying = Prop.Cast<UEStructProperty>().GetUnderlayingStruct())
+				Store.insert(Underlaying.GetIndex());
 		}
 		else if (Prop.IsA(EClassCastFlags::EnumProperty))
 		{
@@ -190,8 +195,16 @@ namespace PackageManagerUtils
 	{
 		for (int32 Dependency : Dependencies)
 		{
-			const int32 PackageIdx = ObjectArray::GetByIndex(Dependency).GetPackageIndex();
+			/* GUObjectArray slots go null when their object is destroyed, and a stale-but-in-range
+			   index lands on one. GetPackageIndex() -> GetOutermost() returns *this unchanged when
+			   it is null (the loop never runs), so GetIndex() then reads +0xC off nullptr -- an AV
+			   at address 0xC. Skip instead: a dependency we cannot resolve is one we cannot emit
+			   an include for anyway, and dropping it degrades the SDK rather than the dump. */
+			const UEObject DependencyObj = ObjectArray::GetByIndex(Dependency);
+			if (!DependencyObj)
+				continue;
 
+			const int32 PackageIdx = DependencyObj.GetPackageIndex();
 
 			if (bAllowToIncludeOwnPackage || PackageIdx != StructPackageIdx)
 			{
@@ -208,7 +221,9 @@ namespace PackageManagerUtils
 		{
 			UEObject DependencyObject = ObjectArray::GetByIndex(Dependency);
 
-			if (!DependencyObject.IsA(EClassCastFlags::Enum))
+			/* Same null-slot hazard as SetPackageDependencies above -- and this one would fault at
+			   +0x10 instead (IsA reads the Class pointer), on the line right after it. */
+			if (!DependencyObject || !DependencyObject.IsA(EClassCastFlags::Enum))
 				continue;
 
 			const int32 PackageIdx = DependencyObject.GetPackageIndex();
@@ -229,6 +244,9 @@ namespace PackageManagerUtils
 		for (int32 DependencyStructIdx : Dependenies)
 		{
 			UEObject Obj = ObjectArray::GetByIndex(DependencyStructIdx);
+
+			if (!Obj)   // null GUObjectArray slot; see SetPackageDependencies
+				continue;
 
 			if (Obj.GetPackageIndex() == StructPackageIndex && !Obj.IsA(EClassCastFlags::Enum))
 				TempSet.insert(DependencyStructIdx);

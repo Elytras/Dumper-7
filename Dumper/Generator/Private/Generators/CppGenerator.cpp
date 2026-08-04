@@ -3239,6 +3239,20 @@ R"({
 		}
 	}
 
+	/* Interface fallback: a UClass's SuperStruct chain NEVER contains the interfaces it implements,
+	   so an interface-qualified lookup (e.g. GetFunction("AssetRegistry", "GetAllAssets") on
+	   AssetRegistryImpl) matches no class above and returns null - even though the function exists
+	   and Blueprints call it. Retry ignoring ClassName. Only reached when the qualified match found
+	   nothing, so exact lookups keep their existing behaviour and precedence. */
+	for (const UStruct* Clss = this; Clss; Clss = Clss->SuperStruct)
+	{
+		for (UField* Field = Clss->Children; Field; Field = Field->Next)
+		{
+			if (Field->HasTypeFlag(EClassCastFlags::Function) && Field->GetName() == FuncName)
+				return static_cast<class UFunction*>(Field);
+		}
+	}
+
 	return nullptr;
 })",
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = false
@@ -3252,6 +3266,20 @@ R"({
 		if (Clss->Name != ClassName)
 			continue;
 
+		for (UField* Field = Clss->Children; Field; Field = Field->Next)
+		{
+			if (Field->HasTypeFlag(EClassCastFlags::Function) && Field->Name == FuncName)
+				return static_cast<class UFunction*>(Field);
+		}
+	}
+
+	/* Interface fallback: a UClass's SuperStruct chain NEVER contains the interfaces it implements,
+	   so an interface-qualified lookup (e.g. GetFunction("AssetRegistry", "GetAllAssets") on
+	   AssetRegistryImpl) matches no class above and returns null - even though the function exists
+	   and Blueprints call it. Retry ignoring ClassName. Only reached when the qualified match found
+	   nothing, so exact lookups keep their existing behaviour and precedence. */
+	for (const UStruct* Clss = this; Clss; Clss = Clss->SuperStruct)
+	{
 		for (UField* Field = Clss->Children; Field; Field = Field->Next)
 		{
 			if (Field->HasTypeFlag(EClassCastFlags::Function) && Field->Name == FuncName)

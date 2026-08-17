@@ -8207,6 +8207,67 @@ namespace UC
 		int32 MaxElements;
 
 	public:
+)";
+
+	if (Settings::Internal::bHasGMalloc)
+	{
+		/* Canonical OWNING array (value semantics matching the engine's TArray): copy-construct/-assign
+		   deep-copy every element through GMalloc, move steals the buffer, and the destructor destructs the
+		   live elements then frees through GMalloc. The 3-arg ctor still ADOPTS an existing engine buffer
+		   (it does NOT copy) -- never hand it a pointer into a live game object, that is a view; use TArray-
+		   View for a zero-copy read. Reading a reflected TArray FIELD stays zero-copy: it is an lvalue
+		   reference into the object and is never destructed. Only TArray VALUES -- returns, temporaries,
+		   locals, Params members -- own and free. */
+		UEContainersHeader << R"(
+		TArray() : Data(nullptr), NumElements(0), MaxElements(0) {}
+
+		TArray(ArrayElementType* Data, int32 NumElements, int32 MaxElements)
+			: Data(Data), NumElements(NumElements), MaxElements(MaxElements) {}
+
+		TArray(const TArray& Other) : Data(nullptr), NumElements(0), MaxElements(0) { CopyFrom(Other); }
+		TArray(TArray&& Other) noexcept
+			: Data(Other.Data), NumElements(Other.NumElements), MaxElements(Other.MaxElements)
+		{ Other.Data = nullptr; Other.NumElements = 0; Other.MaxElements = 0; }
+
+		TArray& operator=(const TArray& Other)
+		{ if (this != &Other) { DestroyOwned(); CopyFrom(Other); } return *this; }
+		TArray& operator=(TArray&& Other) noexcept
+		{
+			if (this != &Other)
+			{
+				DestroyOwned();
+				Data = Other.Data; NumElements = Other.NumElements; MaxElements = Other.MaxElements;
+				Other.Data = nullptr; Other.NumElements = 0; Other.MaxElements = 0;
+			}
+			return *this;
+		}
+
+		~TArray() { DestroyOwned(); }
+
+	private:
+		void DestroyOwned()
+		{
+			if (Data)
+			{
+				for (int32 i = 0; i < NumElements; ++i) Data[i].~ArrayElementType();
+				Internal::UEFree(Data);
+				Data = nullptr;
+			}
+			NumElements = 0; MaxElements = 0;
+		}
+		void CopyFrom(const TArray& Other)
+		{
+			if (Other.NumElements <= 0 || !Other.Data) { Data = nullptr; NumElements = 0; MaxElements = 0; return; }
+			Data = static_cast<ArrayElementType*>(Internal::UEMalloc(
+				static_cast<uint64>(Other.NumElements) * sizeof(ArrayElementType), static_cast<uint32>(ElementAlign)));
+			for (int32 i = 0; i < Other.NumElements; ++i) new (&Data[i]) ArrayElementType(Other.Data[i]);
+			NumElements = Other.NumElements; MaxElements = Other.NumElements;
+		}
+)";
+	}
+	else
+	{
+		UEContainersHeader << R"(
 		TArray()
 			: TArray(nullptr, 0, 0)
 		{
@@ -8221,9 +8282,12 @@ namespace UC
 
 		TArray(TArray&&) = default;
 
-	public:
 		TArray& operator=(TArray&&) = default;
 		TArray& operator=(const TArray&) = default;
+)";
+	}
+
+	UEContainersHeader << R"(
 
 	private:
 		inline int32 GetSlack() const { return MaxElements - NumElements; }
@@ -8422,16 +8486,42 @@ namespace UC
 )";
 
 	UEContainersHeader << R"(
+	/* Non-owning VIEW over an array buffer (Data/Num/Max), typically one living inside a game object.
+	   Trivially copyable, no destructor -- it never frees. The base for FStringView; use it directly for a
+	   zero-copy read of an engine TArray without taking ownership (TArray itself is an owning value type). */
+	template<typename ArrayElementType>
+	class TArrayView
+	{
+	protected:
+		ArrayElementType* Data;
+		int32 NumElements;
+		int32 MaxElements;
+
+	public:
+		TArrayView() : Data(nullptr), NumElements(0), MaxElements(0) {}
+		TArrayView(ArrayElementType* InData, int32 InNum, int32 InMax) : Data(InData), NumElements(InNum), MaxElements(InMax) {}
+
+		inline int32 Num() const { return NumElements; }
+		inline int32 Max() const { return MaxElements; }
+		inline       ArrayElementType* GetDataPtr()       { return Data; }
+		inline const ArrayElementType* GetDataPtr() const { return Data; }
+		inline bool  IsValidIndex(int32 Index) const { return Data && Index >= 0 && Index < NumElements; }
+		inline bool  IsValid() const { return Data && NumElements > 0 && MaxElements >= NumElements; }
+		inline explicit operator bool() const { return IsValid(); }
+		inline       ArrayElementType& operator[](int32 Index)       { return Data[Index]; }
+		inline const ArrayElementType& operator[](int32 Index) const { return Data[Index]; }
+	};
+
 	/* Non-owning VIEW over a wide string buffer (typically one living inside a game object). Trivially
 	   copyable, no destructor -- it never frees. Use this to read engine-owned strings; use FString when
 	   you want an owning value. */
-	class FStringView : public TArray<wchar_t>
+	class FStringView : public TArrayView<wchar_t>
 	{
 	public:
 		friend std::ostream& operator<<(std::ostream& Stream, const FStringView& Str) { return Stream << Str.ToString(); }
 
 	public:
-		FStringView() : TArray(nullptr, 0, 0) {}
+		FStringView() : TArrayView<wchar_t>(nullptr, 0, 0) {}
 
 		FStringView(const wchar_t* Str)
 		{

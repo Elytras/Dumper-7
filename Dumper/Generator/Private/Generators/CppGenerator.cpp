@@ -8422,11 +8422,114 @@ namespace UC
 )";
 
 	UEContainersHeader << R"(
+	/* Non-owning VIEW over a wide string buffer (typically one living inside a game object). Trivially
+	   copyable, no destructor -- it never frees. Use this to read engine-owned strings; use FString when
+	   you want an owning value. */
+	class FStringView : public TArray<wchar_t>
+	{
+	public:
+		friend std::ostream& operator<<(std::ostream& Stream, const FStringView& Str) { return Stream << Str.ToString(); }
+
+	public:
+		FStringView() : TArray(nullptr, 0, 0) {}
+
+		FStringView(const wchar_t* Str)
+		{
+			const uint32 N = Str ? static_cast<uint32>(wcslen(Str) + 1) : 0;
+			Data = const_cast<wchar_t*>(Str);
+			NumElements = N;
+			MaxElements = N;
+		}
+
+		FStringView(const wchar_t* Str, int32 Num, int32 Max) { Data = const_cast<wchar_t*>(Str); NumElements = Num; MaxElements = Max; }
+
+	public:
+		inline std::string  ToString()  const { return *this ? UtfN::Utf16StringToUtf8String<std::string>(Data, NumElements - 1) : std::string(); }
+		inline std::wstring ToWString() const { return *this ? std::wstring(Data) : std::wstring(); }
+		inline const wchar_t* CStr() const { return Data; }
+		inline int32 Len()     const { return NumElements > 0 ? NumElements - 1 : 0; }
+		inline bool  IsEmpty() const { return Len() == 0; }
+		inline bool operator==(const FStringView& O) const { return O ? NumElements == O.NumElements && wcscmp(Data, O.Data) == 0 : false; }
+		inline bool operator!=(const FStringView& O) const { return !(*this == O); }
+	};
+
 	class FString : public TArray<wchar_t>
 	{
 	public:
 		friend std::ostream& operator<<(std::ostream& Stream, const FString& Str) { return Stream << Str.ToString(); }
+)";
 
+	/* With a GMalloc resolved the SDK can allocate, so FString is a CANONICAL OWNING value type -- full
+	   rule-of-5 matching the engine's own FString: every copy deep-copies through GMalloc and the destructor
+	   frees through it. A string out of a reflected getter / FText::ToString / a member field is then owned
+	   by whoever holds it and freed automatically (no manual ToStringConsume). This is safe because the
+	   engine never destroys a caller-supplied parm buffer -- ProcessEvent's teardown only DestroyValue's its
+	   own local frame (ScriptCore.cpp DestructorLink loop) -- so our dtor is the sole owner of every string a
+	   call returns. Layout stays Data/NumElements/MaxElements, so reinterpret over game memory still works;
+	   for a zero-copy read of engine memory use View() / FStringView.
+
+	   Without a GMalloc there is no allocator, so FString falls back to the old NON-OWNING view (a destructor
+	   freeing through a missing Internal::UEFree would not compile). */
+	if (Settings::Internal::bHasGMalloc)
+	{
+		UEContainersHeader << R"(
+	private:
+		void Release() { if (Data) { Internal::UEFree(Data); Data = nullptr; } NumElements = 0; MaxElements = 0; }
+
+		void AssignChars(const wchar_t* Src, int32 CharLen)
+		{
+			if (!Src || CharLen <= 0) { Data = nullptr; NumElements = 0; MaxElements = 0; return; }
+			const int32 N = CharLen + 1;
+			Data = static_cast<wchar_t*>(Internal::UEMalloc(static_cast<uint64>(N) * sizeof(wchar_t), alignof(wchar_t)));
+			for (int32 i = 0; i < CharLen; ++i) Data[i] = Src[i];
+			Data[CharLen] = L'\0';
+			NumElements = N;
+			MaxElements = N;
+		}
+
+	public:
+		FString() : TArray(nullptr, 0, 0) {}
+
+		/* Deep copy from a wide C-string (owns its buffer). */
+		FString(const wchar_t* Str) : TArray(nullptr, 0, 0) { AssignChars(Str, Str ? static_cast<int32>(wcslen(Str)) : 0); }
+
+		/* Deep copy from a narrow string (widened as Latin-1; intended for ASCII). */
+		FString(const char* Str) : TArray(nullptr, 0, 0)
+		{
+			int32 Len = 0;
+			if (Str) while (Str[Len] != '\0') ++Len;
+			if (Len <= 0) return;
+			const int32 N = Len + 1;
+			Data = static_cast<wchar_t*>(Internal::UEMalloc(static_cast<uint64>(N) * sizeof(wchar_t), alignof(wchar_t)));
+			for (int32 i = 0; i < Len; ++i) Data[i] = static_cast<wchar_t>(static_cast<unsigned char>(Str[i]));
+			Data[Len] = L'\0';
+			NumElements = N;
+			MaxElements = N;
+		}
+
+		/* ADOPT an existing engine (GMalloc) buffer of Num used / Max capacity wide chars, taking ownership
+		   (freed on destruction). Do NOT pass a pointer into a game object -- that is a view (FStringView). */
+		FString(wchar_t* Str, int32 Num, int32 Max) : TArray(Str, Num, Max) {}
+
+		/* Deep copy from a view. */
+		explicit FString(const FStringView& V) : TArray(nullptr, 0, 0) { AssignChars(V.CStr(), V.Len()); }
+
+		FString(const FString& O) : TArray(nullptr, 0, 0) { AssignChars(O.Data, O.Len()); }
+		FString(FString&& O) noexcept : TArray(O.Data, O.NumElements, O.MaxElements) { O.Data = nullptr; O.NumElements = 0; O.MaxElements = 0; }
+
+		FString& operator=(const FString& O) { if (this != &O) { Release(); AssignChars(O.Data, O.Len()); } return *this; }
+		FString& operator=(FString&& O) noexcept { if (this != &O) { Release(); Data = O.Data; NumElements = O.NumElements; MaxElements = O.MaxElements; O.Data = nullptr; O.NumElements = 0; O.MaxElements = 0; } return *this; }
+		FString& operator=(const wchar_t* Str) { Release(); AssignChars(Str, Str ? static_cast<int32>(wcslen(Str)) : 0); return *this; }
+
+		~FString() { Release(); }
+
+		/* Zero-copy view over this string's buffer. */
+		inline FStringView View() const { return FStringView(Data, NumElements, MaxElements); }
+)";
+	}
+	else
+	{
+		UEContainersHeader << R"(
 	public:
 		using TArray::TArray;
 
@@ -8439,28 +8542,16 @@ namespace UC
 			MaxElements = NullTerminatedLength;
 		}
 
-		/* Owning copy from a narrow string (widened as Latin-1; intended for ASCII). Unlike the
-		   const wchar_t* view above this allocates, so free it with FMemory::Free when done. */
-		FString(const char* Str)
-		{
-			int32 Len = 0;
-			while (Str[Len] != '\0')
-				++Len;
-
-			Reserve(Len + 1);
-			for (int32 i = 0; i < Len; ++i)
-				Data[i] = static_cast<wchar_t>(static_cast<unsigned char>(Str[i]));
-			Data[Len] = L'\0';
-			NumElements = Len + 1;
-		}
-
 		FString(wchar_t* Str, int32 Num, int32 Max)
 		{
 			Data = Str;
 			NumElements = Num;
 			MaxElements = Max;
 		}
+)";
+	}
 
+	UEContainersHeader << R"(
 	public:
 		inline std::string ToString() const
 		{

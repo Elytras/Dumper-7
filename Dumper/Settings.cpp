@@ -208,6 +208,7 @@ void Settings::Config::Load()
 	   built-in default instead of silently forcing the flag off. An explicit ini entry still overrides. */
 	bKeepObjectsAliveForDump = GetPrivateProfileIntA("Settings", "KeepObjectsAlive", bKeepObjectsAliveForDump ? 1 : 0, ConfigPath) != 0;
 	bCoexistWithMod          = GetPrivateProfileIntA("Settings", "CoexistWithMod",   bCoexistWithMod          ? 1 : 0, ConfigPath) != 0;
+	bPreloadAssetsBeforeDump = GetPrivateProfileIntA("Settings", "PreloadAssets",   bPreloadAssetsBeforeDump ? 1 : 0, ConfigPath) != 0;
 
 	char HotkeyStr[32] = {};
 	GetPrivateProfileStringA("Settings", "DumpHotkey", "", HotkeyStr, sizeof(HotkeyStr), ConfigPath);

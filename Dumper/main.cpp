@@ -19,6 +19,7 @@
 
 #include "Unreal/ObjectArray.h"
 #include "Unreal/GcKeep.h"
+#include "AssetPreload.h"
 #include "OffsetFinder/Offsets.h"
 #include "Platform.h"
 
@@ -201,7 +202,7 @@ static void TickHook(void* This, float DeltaSeconds, bool bIdleMode)
 	   only fall through to the dump once the dump hotkey is pressed. Only classes (+ package + CDO) are
 	   pinned - not their instances - so the game plays normally while roaming. The hook stays installed
 	   (one frame is never "parked") until then. */
-	if (Settings::Config::bKeepObjectsAliveForDump)
+	if (Settings::Config::bKeepObjectsAliveForDump || Settings::Config::bPreloadAssetsBeforeDump)
 	{
 		/* First tick: scan EVERY existing object in one full sweep, rooting each class found (+ its
 		   package + CDO), so no class the eventual dump will touch can be unloaded during the wait.
@@ -224,7 +225,18 @@ static void TickHook(void* This, float DeltaSeconds, bool bIdleMode)
 			ObjectArray::KeepNewFromGC(KeepBatchPerTick);
 		}
 
-		if (!(GetAsyncKeyState(Settings::Config::DumpHotkey) & 0x8000))
+		/* Force-load the cooked asset tree a batch per tick (see AssetPreload.h). Runs before the
+		   hotkey gate so KeepObjectsAlive + PreloadAssets means "preload, then let me roam"; with
+		   PreloadAssets alone the dump fires the moment the preload finishes. The rooting above is
+		   what keeps everything it pulls in alive until then. */
+		if (Settings::Config::bPreloadAssetsBeforeDump)
+		{
+			constexpr int32 PreloadBatchPerTick = 100;
+			if (AssetPreload::Pump(PreloadBatchPerTick))
+				return g_OriginalTick(This, DeltaSeconds, bIdleMode);
+		}
+
+		if (Settings::Config::bKeepObjectsAliveForDump && !(GetAsyncKeyState(Settings::Config::DumpHotkey) & 0x8000))
 			return g_OriginalTick(This, DeltaSeconds, bIdleMode); // dump not triggered yet - keep looping
 	}
 
@@ -414,13 +426,19 @@ DWORD MainThread(HMODULE Module)
 
 	if (InstallTickHook())
 	{
-		if (Settings::Config::bKeepObjectsAliveForDump)
+		if (Settings::Config::bKeepObjectsAliveForDump || Settings::Config::bPreloadAssetsBeforeDump)
 		{
 			/* KeepObjectsAlive: the hook re-roots every tick and waits for the user. No grace-timeout
-			   fallback (that would auto-dump and defeat the point) - block until the hotkey fires the dump. */
-			std::cerr << std::format("[Dumper-7] KeepObjectsAlive ON: re-rooting all objects on the game thread.\n"
-				"           Roam the game / load levels to pull objects in, then press hotkey 0x{:X} to dump.\n",
-				Settings::Config::DumpHotkey);
+			   fallback (that would auto-dump and defeat the point) - block until the hotkey fires the dump.
+			   PreloadAssets waits the same way for a different reason: the preload takes minutes of ticks
+			   before the hook claims the dump, so any grace timeout would fire mid-preload and steal the
+			   dump off-thread. Both cases have a demonstrably ticking hook, so waiting cannot hang. */
+			if (!Settings::Config::bKeepObjectsAliveForDump)
+				std::cerr << "[Dumper-7] PreloadAssets ON: force-loading the asset tree, then dumping automatically.\n";
+			else
+				std::cerr << std::format("[Dumper-7] KeepObjectsAlive ON: re-rooting all objects on the game thread.\n"
+					"           Roam the game / load levels to pull objects in, then press hotkey 0x{:X} to dump.\n",
+					Settings::Config::DumpHotkey);
 			WaitForSingleObject(g_DumpDoneEvent, INFINITE);
 		}
 		else if (Settings::Config::bCoexistWithMod)

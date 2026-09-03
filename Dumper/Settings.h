@@ -38,6 +38,15 @@ namespace Settings
 		   in some games (leaving the dumper stuck) - opt in via the INI once that's reliable. */
 		inline bool bKeepObjectsAliveForDump = false;
 
+		/* On by default: before dumping, force-load every asset the AssetRegistry knows about (see AssetPreload.h)
+		   so the SDK contains Blueprint classes the game had not touched yet. Implies the game-thread Tick
+		   hook, since the load is pumped a batch per tick. On its own the dump fires as soon as the preload
+		   finishes; combined with KeepObjectsAlive it preloads first, then waits for DumpHotkey so you can
+		   roam as well. Dumper-7.ini [Settings] PreloadAssets=1. Heavy - a full tree is tens of thousands
+		   of packages - and ON by default: a stale-SDK mod cannot run its own loadassets, which is
+		   the whole reason this exists. Set PreloadAssets=0 to skip it for one dump. */
+		inline bool bPreloadAssetsBeforeDump = true;
+
 		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode.
 		   Named rather than a bare 0x79 so the default is readable where it is declared.
 		   Dumper-7.ini [Settings] DumpHotkey=0x79 overrides it (decimal or 0x-hex — the INI stays

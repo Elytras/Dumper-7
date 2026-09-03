@@ -1,5 +1,78 @@
 #include "Managers/EnumManager.h"
 
+namespace BlueprintEnumNames
+{
+	/*
+	A UserDefinedEnum (Blueprint enum) does not store the names the dev typed. Its members are literally
+	called "NewEnumeratorN"; the real names live in UUserDefinedEnum::DisplayNameMap, a TMap<FName, FText>
+	that IS cooked into shipping builds (it is a plain UPROPERTY, not WITH_EDITORONLY_DATA).
+
+	Rather than walk that map and crack FText - both of which are engine-version-specific layouts - ask the
+	engine. UKismetNodeHelperLibrary::GetEnumeratorUserFriendlyName(Enum, Value) does the DisplayNameMap
+	lookup and the FText->FString conversion internally, and exists in every version we care about
+	(4.27 GetDisplayNameTextByValue, 5.6 GetValueOrBitfieldAsDisplayNameText - both keyed by VALUE, not
+	index, which matters because BP enum values are not in declaration order). Calling a reflected
+	UFunction during a dump is already established practice here (see main.cpp's GetGameName and the
+	Conv_StringToText call in Offsets.cpp).
+
+	Everything is best-effort: if the class, the function, or any of its params can't be resolved, this
+	returns empty and the caller keeps the original NewEnumeratorN name.
+	*/
+	static UEFunction GetFriendlyNameFunc()
+	{
+		static bool bTriedResolve = false;
+		static UEFunction Func = nullptr;
+
+		if (!bTriedResolve)
+		{
+			bTriedResolve = true;
+
+			if (UEClass NodeHelper = ObjectArray::FindClassFast("KismetNodeHelperLibrary"))
+				Func = NodeHelper.GetFunction("KismetNodeHelperLibrary", "GetEnumeratorUserFriendlyName");
+
+			if (!Func)
+				std::cerr << "Dumper-7: no GetEnumeratorUserFriendlyName, Blueprint enums keep their NewEnumeratorN names.\n";
+		}
+
+		return Func;
+	}
+
+	/* Returns the dev-facing name for one enumerator, or an empty string if it can't be had. */
+	static std::wstring GetUserFriendlyName(UEObject Enum, int64 Value)
+	{
+		UEFunction Func = GetFriendlyNameFunc();
+
+		/* uint8 param - a value that doesn't fit could never round-trip, so don't even ask. */
+		if (!Func || !Enum || Value < 0 || Value > 0xFF)
+			return {};
+
+		const UEProperty EnumParam = Func.FindMember("Enum", EClassCastFlags::ObjectProperty);
+		const UEProperty ValueParam = Func.FindMember("EnumeratorValue", EClassCastFlags::ByteProperty);
+		const UEProperty ReturnParam = Func.FindMember("ReturnValue", EClassCastFlags::StrProperty);
+
+		if (!EnumParam || !ValueParam || !ReturnParam)
+			return {};
+
+		const int32 ParamSize = Func.GetStructSize();
+
+#pragma warning(disable: 6255)
+		uint8* ParamPtr = static_cast<uint8*>(alloca(ParamSize));
+		memset(ParamPtr, 0, ParamSize);
+
+		*reinterpret_cast<void**>(ParamPtr + EnumParam.GetOffset()) = Enum.GetAddress();
+		*reinterpret_cast<uint8*>(ParamPtr + ValueParam.GetOffset()) = static_cast<uint8>(Value);
+
+		/* Static function - the object we call it on is irrelevant, same as the Conv_StringToText call. */
+		ObjectArray::GetByIndex(0).ProcessEvent(Func, ParamPtr);
+
+		/* The returned FString is engine-allocated, so it is deliberately not freed - freeing an FMemory
+		   allocation with our CRT would corrupt the heap. A few thousand short strings per dump. */
+		const FString& Return = *reinterpret_cast<FString*>(ParamPtr + ReturnParam.GetOffset());
+
+		return Return.IsValid() ? Return.ToWString() : std::wstring{};
+	}
+}
+
 namespace EnumInitHelper
 {
 	template<typename T>
@@ -162,7 +235,21 @@ void EnumManager::InitInternal()
 				if (!NameWitPrefix.ends_with(L"_MAX"))
 					EnumMaxValue = max(EnumMaxValue, static_cast<uint64>(Value));
 
-				auto [NameIndex, bWasInserted] = UniqueEnumValueNames.FindOrAdd(MakeNameValid(NameWitPrefix.substr(NameWitPrefix.find_last_of(L"::") + 1)));
+				std::wstring MemberName = NameWitPrefix.substr(NameWitPrefix.find_last_of(L"::") + 1);
+
+				/* Only ever touch the engine's placeholder names - a native enum's member name is already
+				   the real one, and must not be replaced by a DisplayName that may differ from it. */
+				if (MemberName.starts_with(L"NewEnumerator"))
+				{
+					std::wstring FriendlyName = BlueprintEnumNames::GetUserFriendlyName(Obj, Value);
+
+					/* Keep the placeholder if the lookup came back empty - a named-but-blank enumerator
+					   would collide with every other blank one and read worse than NewEnumeratorN. */
+					if (!FriendlyName.empty())
+						MemberName = std::move(FriendlyName);
+				}
+
+				auto [NameIndex, bWasInserted] = UniqueEnumValueNames.FindOrAdd(MakeNameValid(std::move(MemberName)));
 
 				EnumCollisionInfo CurrentEnumValueInfo;
 				CurrentEnumValueInfo.MemberName = NameIndex;

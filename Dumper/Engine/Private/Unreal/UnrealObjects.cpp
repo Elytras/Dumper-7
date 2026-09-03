@@ -938,7 +938,18 @@ std::string UEProperty::GetName() const
 
 std::string UEProperty::GetValidName() const
 {
-	return Base ? GetFName().ToValidString() : "None";
+	if (!Base)
+		return "None";
+
+	std::string Name = GetFName().ToValidString();
+
+	/* Blueprint-struct fields carry a "_<Index>_<GUID>" tail that means nothing in C++. Members are
+	   the only names that ever have it, which is why this sits here and not in MakeNameValid. */
+	const size_t DevNameLen = FindBlueprintFieldSuffix(Name);
+	if (DevNameLen != std::string_view::npos)
+		Name.resize(DevNameLen);
+
+	return Name;
 }
 
 int32 UEProperty::GetAlignment() const

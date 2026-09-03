@@ -4285,6 +4285,49 @@ namespace Offsets
 
 	if (Settings::Internal::bHasGMalloc)
 	{
+		/* FExec's slot count is HARDCODED from the engine version, not probed from the binary.
+		   UE4's FExec has one Exec; UE5's has four (Exec, Exec_Runtime, Exec_Dev, Exec_Editor),
+		   which the linker ICF-folds onto one body so they read as a single entry in a vtable dump.
+		   Getting this wrong is silent and severe: every slot below shifts, so FMemory::Free()
+		   dispatches to TryMalloc() and hands it the pointer being freed as an allocation size,
+		   surfacing much later as `Ran out of memory allocating <a heap address>`.
+
+		   A version number is an ASSUMPTION about a game's Core, and a vendored or stripped Core
+		   breaks it. That is acceptable only because this dumper targets two near-stock games; the
+		   robust fix is to measure the vtable in-process, which this dumper is uniquely able to do
+		   since it runs inside the game. Until then the assumption is stated in three places: here,
+		   in the generated SDK, and in the dump log. When the version cannot be read, fall back to
+		   UE4 -- the shape this file emitted unconditionally before. */
+		int32 EngineMajor = 0;
+		try { EngineMajor = std::stoi(Settings::Generator::GameVersion.substr(0, Settings::Generator::GameVersion.find('.'))); }
+		catch (...) { EngineMajor = 0; }
+		const bool bFExecHasFourSlots = EngineMajor >= 5;
+
+		std::string ExecSlotsText = std::format(
+			"    /* !! ASSUMED, NOT MEASURED !! The FExec slot count below is hardcoded from the\n"
+			"       engine version reported by the game (\"{}\" -> UE{}, {}).\n"
+			"       If this build ships a vendored or stripped Core, every slot below is misaligned\n"
+			"       and Free() dispatches into TryMalloc(). Cross-check against a live GMalloc\n"
+			"       vtable dump before trusting any allocation through this class. */\n"
+			"    virtual bool Exec(void* World, const wchar_t* Cmd, void* Ar) = 0;\n",
+			Settings::Generator::GameVersion, EngineMajor,
+			bFExecHasFourSlots ? "4 Exec slots" : "1 Exec slot");
+
+		if (bFExecHasFourSlots)
+		{
+			ExecSlotsText +=
+				"    virtual bool Exec_Runtime(void* World, const wchar_t* Cmd, void* Ar) = 0;\n"
+				"    virtual bool Exec_Dev(void* World, const wchar_t* Cmd, void* Ar) = 0;\n"
+				"    virtual bool Exec_Editor(void* World, const wchar_t* Cmd, void* Ar) = 0;\n";
+		}
+
+		std::cerr << "[WARN] FMalloc/FExec vtable shape ASSUMED from engine version \""
+			<< Settings::Generator::GameVersion << "\" -> UE" << EngineMajor << ", "
+			<< (bFExecHasFourSlots ? "4 Exec slots" : "1 Exec slot") << ".\n"
+			<< "       This is NOT probed from the binary. A vendored Core misaligns Malloc/Free\n"
+			<< "       silently; the first symptom is a huge bogus allocation size at runtime.\n"
+			<< "       Cross-check SDKCore.hpp's UnrealAllocator against a live GMalloc vtable.\n\n";
+
 		BasicCoreHpp <<
 			R"(
 namespace InSDKUtils { uintptr_t GetImageBase(); }
@@ -4347,8 +4390,7 @@ public:
     UnrealAllocator& operator=(const UnrealAllocator&) = delete;
 
     virtual void Pad00_Destructor() = 0;
-    virtual bool Exec(void* World, const wchar_t* Cmd, void* Ar) = 0;
-
+)" << ExecSlotsText << R"(
     virtual void* Malloc(uint64_t Count, uint32_t Alignment = 1) = 0;
     virtual void* TryMalloc(uint64_t Count, uint32_t Alignment = 1) = 0;
     virtual void* Realloc(void* Original, uint64_t Count, uint32_t Alignment = 1) = 0;

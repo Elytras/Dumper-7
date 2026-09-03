@@ -2,6 +2,7 @@
 #include <array>
 
 #include "Unreal/ObjectArray.h"
+#include "Platform.h"                 // IsBadReadPtr - GObjects can hold freed slots mid-dump
 #include "Generators/CppGenerator.h"
 #include "Wrappers/MemberWrappers.h"
 #include "Managers/MemberManager.h"
@@ -994,13 +995,20 @@ std::string CppGenerator::GetStructPrefixedName(const StructWrapper& Struct)
 	if (!Struct.GetUnrealStruct())
 		return "UObject";
 
-	// A malformed/transient object can have a null Class pointer (seen on RC while on the ramrod with multiple
-	// PersistentLevels — partially-constructed objects live in GObjects). IsFunction()/GetUniqueName() below
-	// read Class->CastFlags (+0xD8); on a null Class that AVs at 0xD8 and kills the whole dump. Fall back to
-	// UObject instead. (GetName reads only the object's FName, no Class deref, so it's safe here.)
-	if (!Struct.GetUnrealStruct().GetClass())
+	// A malformed/transient object can have a null — or simply dangling — Class pointer (seen on RC while on
+	// the ramrod with multiple PersistentLevels — partially-constructed objects live in GObjects, and after a
+	// PreloadAssets run so do freed ones). IsFunction()/GetUniqueName() below read Class->CastFlags (+0xD8),
+	// which AVs on either and kills the whole dump 60 seconds in. Null alone was not enough: a reclaimed slot
+	// holds a plausible-looking pointer into unmapped memory (seen: 0x229`00000000, faulting at +0xd8), so the
+	// page has to be probed as well — both at the base and at the field, since a UClass spans more than 0xD8
+	// bytes and the two can land in different pages. Fall back to UObject instead: one unusable object must not
+	// cost the dump. (GetName reads only the object's FName, no Class deref, so it's safe here.)
+	const void* const ClassPtr = Struct.GetUnrealStruct().GetClass().GetAddress();
+	if (!ClassPtr
+		|| Platform::IsBadReadPtr(ClassPtr)
+		|| Platform::IsBadReadPtr(static_cast<const uint8*>(ClassPtr) + Off::UClass::CastFlags))
 	{
-		std::cerr << std::format("[CppGenerator] WARNING: struct '{}' has a null Class (malformed object) — using UObject\n", Struct.GetName());
+		std::cerr << std::format("[CppGenerator] WARNING: struct '{}' has an unreadable Class (freed or malformed object) — using UObject\n", Struct.GetName());
 		return "UObject";
 	}
 

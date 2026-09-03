@@ -114,6 +114,7 @@ namespace AssetPreload
 		inline int32 g_Skipped = 0;
 		inline int32 g_EditorOnly = 0;
 		inline bool g_Failed = false;      // setup failed — never retry, just let the dump proceed
+		inline bool g_Done = false;        // finished — KeepObjectsAlive keeps ticking us afterwards
 
 		/*
 		The AssetRegistry singleton, via UAssetRegistryHelpers::GetAssetRegistry().
@@ -147,28 +148,38 @@ namespace AssetPreload
 		*/
 		inline int32 ResolveClassNameOffset(UEStruct AssetData)
 		{
+			/* Two passes, because UE5 keeps BOTH: AssetClassPath is the live one and AssetClass is a
+			   deprecated leftover that is still declared, still reflected, and always None. Taking
+			   whichever came first in the property chain picked the dead one and read every asset's
+			   class as "None" - which the resident-class filter then rejected, all 46091 of them. */
+			UEProperty Legacy;
+
 			for (UEProperty P : AssetData.GetProperties())
 			{
 				const std::string Name = P.GetName();
 
 				if (Name == "AssetClass")
-					return P.GetOffset();
+				{
+					Legacy = P;
+					continue;
+				}
 
 				if (Name == "AssetClassPath")
 				{
 					UEStruct Path = ObjectArray::FindStructFast("TopLevelAssetPath");
 					if (!Path)
-						return -1;
+						break;
 
 					for (UEProperty Inner : Path.GetProperties())
 					{
 						if (Inner.GetName() == "AssetName")
 							return P.GetOffset() + Inner.GetOffset();
 					}
-					return -1;
+					break;
 				}
 			}
-			return -1;
+
+			return Legacy ? Legacy.GetOffset() : -1;
 		}
 
 		inline std::string ClassOf(const uint8_t* Elem)
@@ -279,6 +290,33 @@ namespace AssetPreload
 				return false;
 			}
 
+			/*
+			A filter that rejects EVERY asset is a broken filter, not a game with nothing to load - and it
+			fails silently, because skipping is a legitimate outcome for any single asset. So probe the
+			resolved offset against a sample before trusting it: if not one name in the sample names a
+			resident UClass, drop the filter and load unfiltered rather than skip the whole tree. Costs a
+			few hundred cached FindClassFast calls, once.
+			*/
+			if (g_ClassNameOff >= 0)
+			{
+				const int32 Sample = g_Assets.Num < 256 ? g_Assets.Num : 256;
+				int32 Resident = 0;
+
+				for (int32 i = 0; i < Sample; i++)
+				{
+					const std::string Cls = ClassOf(static_cast<const uint8_t*>(g_Assets.Data) + static_cast<size_t>(i) * g_ElemSize);
+					if (!Cls.empty() && ClassResident(Cls))
+						Resident++;
+				}
+
+				if (Resident == 0)
+				{
+					std::cerr << std::format("[Dumper-7] PreloadAssets: class name at +0x{:X} named no resident class in {} sampled"
+						" asset(s) - filter disabled, loading unfiltered.\n", g_ClassNameOff, Sample);
+					g_ClassNameOff = -1;
+				}
+			}
+
 			std::cerr << std::format("[Dumper-7] PreloadAssets: loading {} asset(s)...\n", g_Assets.Num);
 			return true;
 		}
@@ -297,7 +335,7 @@ namespace AssetPreload
 	{
 		using namespace detail;
 
-		if (g_Failed)
+		if (g_Failed || g_Done)
 			return false;
 
 		if (!g_Assets.Data)
@@ -367,6 +405,9 @@ namespace AssetPreload
 			return true;
 		}
 
+		/* Latched: with KeepObjectsAlive the hook keeps calling us every tick while it waits for the
+		   hotkey, and an unlatched summary printed once per frame until then. */
+		g_Done = true;
 		std::cerr << std::format("[Dumper-7] PreloadAssets: done - {} loaded, {} failed, {} world(s) skipped, {} editor-only of {}.\n",
 			g_Ok, g_Fail, g_Skipped, g_EditorOnly, g_Assets.Num);
 		return false;

@@ -5818,13 +5818,16 @@ R"({
 
 	std::string GetRawStringWithAppendString = std::format(
 		R"({{
+	/* NON-OWNING view: FString OWNS its buffer (dtor UEFrees it), so wrapping a stack array in an
+	   FString frees a stack pointer -> FMallocBinned FindPoolInfo AV on the first ToString().
+	   FStringView has the identical Data/Num/Max layout, so the engine call is unchanged. */
 	wchar_t buffer[1024];
-    FString TempString(buffer, 0, 1024);
+	FStringView TempString(buffer, 0, 1024);
 
 	if (!AppendString)
 		InitInternal();
 
-	InSDKUtils::CallGameFunction(reinterpret_cast<void({}*)(const FName*, FString&)>(AppendString), this, TempString);
+	InSDKUtils::CallGameFunction(reinterpret_cast<void({}*)(const FName*, FStringView&)>(AppendString), this, TempString);
 
 	return TempString.ToString();
 }}
@@ -5832,14 +5835,17 @@ R"({
 
 	constexpr const char* GetRawStringWithInlinedAppendString =
 		R"({
+	/* NON-OWNING view: FString OWNS its buffer (dtor UEFrees it), so wrapping a stack array in an
+	   FString frees a stack pointer -> FMallocBinned FindPoolInfo AV on the first ToString().
+	   FStringView has the identical Data/Num/Max layout, so the engine call is unchanged. */
 	wchar_t buffer[1024];
-    FString TempString(buffer, 0, 1024);
+	FStringView TempString(buffer, 0, 1024);
 
 	if (!AppendString)
 		InitInternal();
 
 	const void* NameEntry = InSDKUtils::CallGameFunction(reinterpret_cast<const void*(*)(uint32 CmpIdx)>(GetNameEntryFromName), ComparisonIndex);
-	InSDKUtils::CallGameFunction(reinterpret_cast<void(*)(const void*, FString&)>(AppendString), NameEntry, TempString);
+	InSDKUtils::CallGameFunction(reinterpret_cast<void(*)(const void*, FStringView&)>(AppendString), NameEntry, TempString);
 
 	std::string OutputString = TempString.ToString();
 

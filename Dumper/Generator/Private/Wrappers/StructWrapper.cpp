@@ -1,4 +1,4 @@
-#include "Wrappers/StructWrapper.h"
+﻿#include "Wrappers/StructWrapper.h"
 #include "Managers/MemberManager.h"
 
 StructWrapper::StructWrapper(const PredefinedStruct* const Predef)
@@ -31,6 +31,11 @@ std::string StructWrapper::GetRawName() const
 std::string StructWrapper::GetFullName() const
 {
     return bIsUnrealStruct ? Struct.GetFullName() : "Predefined struct " + PredefStruct->UniqueName;
+}
+
+std::string StructWrapper::GetPathName() const
+{
+    return bIsUnrealStruct ? Struct.GetPathName() : "Predefined struct " + PredefStruct->UniqueName;
 }
 
 StructWrapper StructWrapper::GetSuper() const

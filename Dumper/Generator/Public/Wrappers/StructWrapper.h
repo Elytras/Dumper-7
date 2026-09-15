@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Unreal/ObjectArray.h"
 
@@ -38,6 +38,9 @@ public:
     std::string GetName() const;
     std::string GetRawName() const;
     std::string GetFullName() const;
+
+    /* GetFullName, but spelling the outer chain by package PATH - see Settings::Config::bFullAssetPaths. */
+    std::string GetPathName() const;
     StructWrapper GetSuper() const;
 
     /* Name, bIsUnique */

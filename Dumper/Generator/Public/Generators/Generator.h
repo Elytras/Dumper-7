@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <filesystem>
 
@@ -68,10 +68,10 @@ public:
             if (!bDumpedGObjects)
             {
                 bDumpedGObjects = true;
-                ObjectArray::DumpObjects(DumperFolder);
+                ObjectArray::DumpObjects(DumperFolder, Settings::Config::bFullAssetPaths);
 
                 if (Settings::Internal::bUseFProperty)
-                    ObjectArray::DumpObjectsWithProperties(DumperFolder);
+                    ObjectArray::DumpObjectsWithProperties(DumperFolder, Settings::Config::bFullAssetPaths);
             }
 
             if (!bDumepdEditorOnlyMetadata)

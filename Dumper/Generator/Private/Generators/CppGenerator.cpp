@@ -727,7 +727,7 @@ void CppGenerator::GenerateStruct(const StructWrapper& Struct, StreamType& Struc
 // 0x{:04X} (0x{:04X} - 0x{:04X})
 {}{}{} {}{}{}{}
 {{
-)", Struct.GetFullName()
+)", Settings::Config::bFullAssetPaths ? Struct.GetPathName() : Struct.GetFullName()
   , StructSizeWithoutSuper
   , StructSize
   , SuperSize

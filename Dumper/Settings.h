@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <string>
 
@@ -46,6 +46,18 @@ namespace Settings
 		   of packages - and ON by default: a stale-SDK mod cannot run its own loadassets, which is
 		   the whole reason this exists. Set PreloadAssets=0 to skip it for one dump. */
 		inline bool bPreloadAssetsBeforeDump = true;
+
+		/* Off by default: spell every object by its PACKAGE PATH rather than its asset name, in the
+		   GObjects dumps and in the SDK's per-class comment. A cooked Blueprint's identity is its path -
+		   /Game/Enemies/Foo.Foo_C - and asset names are unique per path, not globally, so the default
+		   spelling (FName::ToString, which strips the path) makes /Game classes unaddressable and makes
+		   colliding names indistinguishable except by a per-dump index that renumbers on a game update.
+		   Turn it on when the dump feeds a code generator that has to name a Blueprint back to the engine
+		   - the C++-to-Blueprint pipeline in ue-mods (AssetGen/tools/genueapi.py) is what this is for.
+		   Dumper-7.ini [Settings] FullAssetPaths=1. Native classes change spelling too, from
+		   "Class CoreUObject.Object" to "Class /Script/CoreUObject.Object", so a consumer written against
+		   one form has to be told which it is reading. */
+		inline bool bFullAssetPaths = false;
 
 		/* Virtual-key code that triggers the dump in KeepObjectsAlive mode.
 		   Named rather than a bare 0x79 so the default is readable where it is declared.

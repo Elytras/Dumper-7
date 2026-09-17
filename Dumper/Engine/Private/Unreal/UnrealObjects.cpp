@@ -1286,7 +1286,17 @@ std::string UEProperty::GetPropClassName() const
 
 std::string UEProperty::StringifyFlags() const
 {
-	return StringifyPropertyFlags(GetPropertyFlags());
+	std::string Flags = StringifyPropertyFlags(GetPropertyFlags());
+
+	/* The function a RepNotify property calls on clients, so a code generator can call it after a local set too. */
+	if ((GetPropertyFlags() & EPropertyFlags::RepNotify) && Off::Property::RepNotifyFunc > 0)
+	{
+		const std::string Func = FName(Base + Off::Property::RepNotifyFunc).ToString();
+		if (!Func.empty() && Func != "None")
+			Flags += ", RepNotifyFunc=" + Func;
+	}
+
+	return Flags;
 }
 
 UEEnum UEByteProperty::GetEnum() const

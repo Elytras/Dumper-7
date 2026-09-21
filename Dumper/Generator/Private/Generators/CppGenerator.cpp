@@ -71,8 +71,85 @@ std::string CppGenerator::GenerateBitPadding(uint8 UnderlayingSizeBytes, const u
 	return MakeMemberString(GetTypeFromSize(UnderlayingSizeBytes), std::format("BitPad_{:X}_{:X} : {:d}", Offset, PrevBitPropertyEndBit, PadSize), std::format("0x{:04X}(0x{:04X})({})", Offset, UnderlayingSizeBytes, std::move(Reason)));
 }
 
+/*
+A Blueprint class's component variables are nodes of its SimpleConstructionScript, and the key a CHILD Blueprint
+overrides such a component's template by is the node's VariableGuid (UInheritableComponentHandler, FComponentKey:
+OwnerClass + SCSVariableName + AssociatedGuid). The guid exists nowhere in the reflected layout, so a code generator
+that wants to write an override needs it said: "ScsNode=<the guid's 16 bytes as hex>", keyed here by the node's
+variable name - which is the property's real name, spaces and all.
+
+Everything is reached through reflection (SimpleConstructionScript on the BlueprintGeneratedClass, AllNodes on the
+script, InternalVariableName / VariableGuid on the node), so no offset is assumed and a game without one of them
+gets no entry instead of a wrong one.
+*/
+static std::unordered_map<std::string, std::string> CollectScsNodeGuids(const StructWrapper& Struct)
+{
+	std::unordered_map<std::string, std::string> Guids;
+
+	if (!Struct.IsClass() || !Struct.IsUnrealStruct())
+		return Guids;
+
+	auto FindUp = [](UEStruct In, const char* MemberName) -> UEProperty
+	{
+		for (UEStruct S = In; S; S = S.GetSuper())
+		{
+			if (UEProperty P = S.FindMember(MemberName))
+				return P;
+		}
+		return nullptr;
+	};
+	auto ReadPtr = [](const void* Base, int32 Offset) -> void*
+	{
+		const uint8* At = static_cast<const uint8*>(Base) + Offset;
+		return Platform::IsBadReadPtr(At) ? nullptr : *reinterpret_cast<void* const*>(At);
+	};
+
+	UEStruct Class = Struct.GetUnrealStruct();
+	const UEProperty ScsProp = FindUp(Class.GetClass(), "SimpleConstructionScript");
+	if (!ScsProp)
+		return Guids; // a native UClass
+
+	UEObject Scs(ReadPtr(Class.GetAddress(), ScsProp.GetOffset()));
+	if (!Scs || Platform::IsBadReadPtr(Scs.GetAddress()))
+		return Guids;
+
+	const UEProperty NodesProp = FindUp(Scs.GetClass(), "AllNodes");
+	if (!NodesProp)
+		return Guids;
+
+	struct FRawArray { void** Data; int32 Num; int32 Max; };
+	const FRawArray* Nodes = reinterpret_cast<const FRawArray*>(static_cast<const uint8*>(Scs.GetAddress()) + NodesProp.GetOffset());
+	if (Nodes->Num <= 0 || Nodes->Num > 0x4000 || Platform::IsBadReadPtr(Nodes->Data))
+		return Guids;
+
+	for (int32 i = 0; i < Nodes->Num; i++)
+	{
+		UEObject Node(Nodes->Data[i]);
+		if (!Node || Platform::IsBadReadPtr(Node.GetAddress()))
+			continue;
+
+		const UEProperty NameProp = FindUp(Node.GetClass(), "InternalVariableName");
+		const UEProperty GuidProp = FindUp(Node.GetClass(), "VariableGuid");
+		if (!NameProp || !GuidProp)
+			return Guids;
+
+		const uint8* NodeBase = static_cast<const uint8*>(Node.GetAddress());
+		const uint8* Guid = NodeBase + GuidProp.GetOffset();
+
+		std::string Hex;
+		for (int b = 0; b < 16; b++)
+			Hex += std::format("{:02x}", Guid[b]);
+
+		Guids[FName(NodeBase + NameProp.GetOffset()).ToString()] = std::move(Hex);
+	}
+
+	return Guids;
+}
+
 std::string CppGenerator::GenerateMembers(const StructWrapper& Struct, const MemberManager& Members, int32 SuperSize, int32 SuperLastMemberEnd, int32 SuperAlign, int32 PackageIndex)
 {
+	const std::unordered_map<std::string, std::string> ScsNodeGuids = CollectScsNodeGuids(Struct);
+
 	constexpr uint64 EstimatedCharactersPerLine = 0xF0;
 
 	const bool bIsUnion = Struct.IsUnion();
@@ -125,7 +202,15 @@ std::string CppGenerator::GenerateMembers(const StructWrapper& Struct, const Mem
 
 		const int32 CurrentPropertyEnd = MemberOffset + MemberSize;
 
-		std::string Comment = std::format("0x{:04X}(0x{:04X})({})", MemberOffset, MemberSize, Member.GetFlagsOrCustomComment());
+		std::string MemberFlags = Member.GetFlagsOrCustomComment();
+		if (!ScsNodeGuids.empty() && Member.IsUnrealProperty())
+		{
+			const auto Node = ScsNodeGuids.find(Member.GetUnrealProperty().GetName());
+			if (Node != ScsNodeGuids.end())
+				MemberFlags += ", ScsNode=" + Node->second;
+		}
+
+		std::string Comment = std::format("0x{:04X}(0x{:04X})({})", MemberOffset, MemberSize, MemberFlags);
 
 		const bool bIsBitField = Member.IsBitField();
 

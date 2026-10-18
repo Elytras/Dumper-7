@@ -1038,40 +1038,43 @@ int32_t OffsetFinder::FindMinAlignmentOffset()
 int32_t OffsetFinder::FindScriptOffset()
 {
 	/* UStruct::Script (TArray<uint8> Blueprint bytecode) sits immediately after MinAlignment (int32) across
-	   UE4.15-5.x. Derive from the binary-found MinAlignment anchor, then VERIFY the TArray shape against a real
-	   scripted UFunction that actually carries bytecode (Data readable, 0 < Num <= Max). Dumper-7 did not emit
-	   this before; the BP-VM disassembler needs it. */
+	   UE4.15-5.x. Derive from the binary-found MinAlignment anchor, then verify it against the scripts of the
+	   game's Blueprint functions. Dumper-7 did not emit this before; the BP-VM disassembler needs it. */
 	if (Off::UStruct::MinAlignment == OffsetNotFound)
 		return OffsetNotFound;
 
 	const int32 Candidate = Align(Off::UStruct::MinAlignment + static_cast<int32>(sizeof(int32)), static_cast<int32>(sizeof(void*)));
 
-	/* A native function has no bytecode, so its array there must be empty; at least one scripted one
-	   must hold a real array. */
-	bool bFoundBytecode = false;
+	/* A compiled Kismet script ends in EX_EndOfScript (0x53, the same on UE4 and UE5). Nearly every scripted
+	   function holding a non-empty array there must hold such a script - not all, as a mod loader may patch
+	   some - while at a wrong offset next to none would. Native functions are left out. */
+	constexpr uint8 EX_EndOfScript = 0x53;
+
+	int32 NumArrays = 0;
+	int32 NumScripts = 0;
 
 	for (UEObject Obj : ObjectArray())
 	{
-		if (!Obj.IsA(EClassCastFlags::Function))
+		if (!Obj.IsA(EClassCastFlags::Function) || Obj.Cast<UEFunction>().HasFlags(EFunctionFlags::Native))
 			continue;
 
 		const uint8* const Addr = static_cast<const uint8*>(Obj.GetAddress());
-		const void* const ScriptData = *reinterpret_cast<void* const*>(Addr + Candidate);
+		const uint8* const ScriptData = *reinterpret_cast<const uint8* const*>(Addr + Candidate);
 		const int32 ScriptNum = *reinterpret_cast<const int32*>(Addr + Candidate + 0x08);
 		const int32 ScriptMax = *reinterpret_cast<const int32*>(Addr + Candidate + 0x0C);
 
-		if (Obj.Cast<UEFunction>().HasFlags(EFunctionFlags::Native))
-		{
-			if (ScriptNum != 0)
-				return OffsetNotFound;
-
+		if (ScriptNum == 0)
 			continue;
-		}
 
-		bFoundBytecode = bFoundBytecode || (ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData));
+		NumArrays++;
+
+		NumScripts += ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData)
+			&& !Platform::IsBadReadPtr(ScriptData + ScriptNum - 1) && ScriptData[ScriptNum - 1] == EX_EndOfScript;
 	}
 
-	return bFoundBytecode ? Candidate : OffsetNotFound;
+	std::cerr << std::format("UStruct::Script candidate 0x{:X}: {} of {} non-empty arrays end in EX_EndOfScript\n", Candidate, NumScripts, NumArrays);
+
+	return NumScripts > 0 && NumScripts * 100 >= NumArrays * 95 ? Candidate : OffsetNotFound;
 }
 
 int32_t OffsetFinder::FindStructBaseChainOffset()

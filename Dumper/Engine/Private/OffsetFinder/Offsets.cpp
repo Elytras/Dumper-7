@@ -1143,11 +1143,16 @@ void Off::Init()
 	Off::Property::BlueprintReplicationCondition = OffsetFinder::FindBlueprintReplicationConditionOffset(Off::Property::RepIndex);
 	std::cerr << std::format("Off::Property::BlueprintReplicationCondition: 0x{:X}\n", Off::Property::BlueprintReplicationCondition);
 
-	Off::Property::RepNotifyFunc = OffsetFinder::FindRepNotifyFuncOffset(Off::Property::Offset_Internal);
-	std::cerr << std::format("Off::Property::RepNotifyFunc: 0x{:X}\n", Off::Property::RepNotifyFunc);
-
-	Off::Property::PropertyLinkNext = OffsetFinder::FindPropertyLinkNextOffset(Off::Property::RepNotifyFunc);
+	Off::Property::PropertyLinkNext = OffsetFinder::FindPropertyLinkNextOffset(Off::Property::Offset_Internal);
+	if (Off::Property::PropertyLinkNext == OffsetFinder::OffsetNotFound)
+	{
+		Off::Property::PropertyLinkNext = (Off::Property::Offset_Internal + sizeof(int32) + Off::InSDK::Name::FNameSize + 7) & ~7;
+		std::cerr << "Dumper-7 WARNING: FProperty::PropertyLinkNext not found by FGuid's link chain - the UE4 layout is assumed.\n";
+	}
 	std::cerr << std::format("Off::Property::PropertyLinkNext: 0x{:X}\n", Off::Property::PropertyLinkNext);
+
+	Off::Property::RepNotifyFunc = OffsetFinder::FindRepNotifyFuncOffset(Off::Property::Offset_Internal, Off::Property::PropertyLinkNext);
+	std::cerr << std::format("Off::Property::RepNotifyFunc: 0x{:X}\n", Off::Property::RepNotifyFunc);
 
 	Off::Property::NextRef = OffsetFinder::FindNextRefOffset(Off::Property::PropertyLinkNext);
 	std::cerr << std::format("Off::Property::NextRef: 0x{:X}\n", Off::Property::NextRef);

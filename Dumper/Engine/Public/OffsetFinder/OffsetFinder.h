@@ -126,12 +126,12 @@ namespace OffsetFinder
 	int32_t FindArrayDimOffset();
 	int32_t FindPropertyFlagsOffset();
 	int32_t FindOffsetInternalOffset();
+	int32 FindPropertyLinkNextOffset(int32 OffsetInternalOffset);
+	int32 FindRepNotifyFuncOffset(int32 OffsetInternalOffset, int32 PropertyLinkNextOffset);
 
 	/* Property (hardcoded, pending real discovery) */
 	int32 FindRepIndexOffset(int32 PropertySize);
 	int32 FindBlueprintReplicationConditionOffset(int32 PropertySize);
-	int32 FindRepNotifyFuncOffset(int32 PropertySize);
-	int32 FindPropertyLinkNextOffset(int32 PropertySize);
 	int32 FindNextRefOffset(int32 PropertySize);
 	int32 FindDestructorLinkNextOffset(int32 PropertySize);
 	int32 FindPostConstructLinkNextOffset(int32 PropertySize);

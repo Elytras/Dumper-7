@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <vector>
 #include <random>
 
@@ -1224,19 +1225,66 @@ int32 OffsetFinder::FindBlueprintReplicationConditionOffset(const int32 RepIndex
 	return RepIndexOffset + sizeof(uint16);
 }
 
-int32 OffsetFinder::FindRepNotifyFuncOffset(const int32 OffsetInternalOffset)
+/*
+PropertyLinkNext is the one FProperty slot that points at a sibling: UStruct::Link chains a struct's
+properties through it, so FGuid's four members link A -> B -> C -> D with exactly one null at the
+end. It is found by that chain rather than counted from Offset_Internal, because UE5 moved
+RepNotifyFunc from in front of the four link pointers to behind them (5.6 UnrealType.h). Counting
+the UE4 way on a 5.6 build reads PropertyLinkNext as an FName, and the first RepNotify property
+whose link pointer is not a valid name index crashed the game inside FName::ToString.
+*/
+int32 OffsetFinder::FindPropertyLinkNextOffset(const int32 OffsetInternalOffset)
 {
-	return OffsetInternalOffset + sizeof(uint32);
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+
+	std::vector<uintptr_t> Members;
+	for (const char* Name : { "A", "B", "C", "D" })
+	{
+		if (void* Member = Guid.FindMember(Name).GetAddress())
+			Members.push_back(reinterpret_cast<uintptr_t>(Member));
+	}
+
+	if (Members.size() != 4)
+		return OffsetNotFound;
+
+	/* The UE5 slot comes first; the UE4 one sits past RepNotifyFunc. */
+	const int32 First = Align(OffsetInternalOffset + static_cast<int32>(sizeof(int32)), static_cast<int32>(sizeof(void*)));
+	const int32 Last = First + Off::InSDK::Name::FNameSize + static_cast<int32>(sizeof(void*));
+
+	for (int32 Offset = First; Offset <= Last; Offset += sizeof(void*))
+	{
+		int32 Links = 0;
+		int32 Nulls = 0;
+
+		for (const uintptr_t Member : Members)
+		{
+			const uintptr_t Next = *reinterpret_cast<const uintptr_t*>(Member + Offset);
+
+			Links += std::find(Members.begin(), Members.end(), Next) != Members.end();
+			Nulls += Next == 0;
+		}
+
+		if (Links == 3 && Nulls == 1)
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
-int32 OffsetFinder::FindPropertyLinkNextOffset(const int32 RepNotifyFuncOffset)
+/* UE4 keeps RepNotifyFunc between Offset_Internal and PropertyLinkNext; UE5 puts it after the four link pointers. */
+int32 OffsetFinder::FindRepNotifyFuncOffset(const int32 OffsetInternalOffset, const int32 PropertyLinkNextOffset)
 {
-	return RepNotifyFuncOffset + sizeof(uint64);
+	const int32 UE4Slot = OffsetInternalOffset + sizeof(int32);
+
+	if (PropertyLinkNextOffset >= UE4Slot + Off::InSDK::Name::FNameSize)
+		return UE4Slot;
+
+	return PropertyLinkNextOffset + 4 * sizeof(void*);
 }
 
 int32 OffsetFinder::FindNextRefOffset(const int32 PropertyLinkNextOffset)
 {
-	return PropertyLinkNextOffset + Off::InSDK::Name::FNameSize;
+	return PropertyLinkNextOffset + sizeof(void*);
 }
 
 int32 OffsetFinder::FindDestructorLinkNextOffset(const int32 NextRefOffset)

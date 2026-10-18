@@ -1,7 +1,22 @@
 #pragma once
 
+#include <filesystem>
+#include <string>
+#include <vector>
+
 #include "Unreal/Enums.h"
 #include "../Settings.h"
+
+/* How a value in the offset table was obtained. Printed beside every offset (see Off::Log), so the
+   next game update's log diff shows which layouts moved and which were never checked on this build. */
+enum class EOffsetSource : uint8
+{
+	Scan,     // found, or verified, against live objects or code of this very build
+	Override, // set by hand in Generator::InitEngineCore()
+	Default,  // not checkable on this build: a known value, applied only where its note says it holds
+	Missing,  // not found: never read, and whatever needs it is skipped
+	Unused,   // nothing in this game has it (a property kind it never uses), so there is nothing to find
+};
 
 struct FFixedUObjectArrayLayout
 {
@@ -31,7 +46,33 @@ struct FChunkedFixedUObjectArrayLayout
 
 namespace Off
 {
-	void Init();
+	/* Finds and logs every offset below. False when it had to stop early: an essential offset is missing
+	   and the finders after it would read through it. */
+	bool Init();
+
+	/* The offset table. Every finder result goes through one of these: they print the entry at once,
+	   so a crash later in init still leaves it in Dumper-7.log, and keep it for the summary at the end
+	   of Generator::InitEngineCore() and for the Offsets.txt written beside each dump. Each returns the
+	   value to store, so a call sits on the right-hand side of the assignment it logs. */
+	int32 Log(const std::string& Name, int32 Value, EOffsetSource Source, const std::string& Note = {});
+
+	/* A finder's result: Scan, or Missing when it returned OffsetFinder::OffsetNotFound. */
+	int32 Found(const std::string& Name, int32 Value);
+
+	/* A finder's result, or - only when it failed and bDefaultHolds - Default, logged with HoldsFor, the
+	   engine versions it is known for. With bDefaultHolds false a failed finder stays Missing. */
+	int32 FoundOr(const std::string& Name, int32 Value, int32 Default, bool bDefaultHolds, const std::string& HoldsFor);
+
+	/* A module-relative function address from a signature scan; 0 is logged as Missing and returned as 0. */
+	int32 FoundRva(const std::string& Name, int32 Rva);
+
+	/* The essential fields (UObject/UStruct/FField/FProperty basics) that came out Missing. Without them
+	   no dump is possible, so Generator::InitEngineCore() stops instead of reading at a guessed offset. */
+	std::vector<std::string> MissingEssentials();
+
+	/* Counts per source, plus every entry that is not a plain scan, printed once init is done. */
+	void PrintSummary();
+	void WriteTable(const std::filesystem::path& File);
 
 	//Offsets not to be used during generation but inside of the generated SDK
 	namespace InSDK
@@ -218,6 +259,11 @@ namespace Off
 		inline int32 GetMaxChunksOffset() { return  bIsChunked ? ChunkedFixedLayout.MaxChunksOffset : 0x0; }
 	}
 
+	namespace FUObjectItem
+	{
+		inline int32 Flags = -1; // EInternalObjectFlags, behind the object pointer; -1 until confirmed
+	}
+
 	namespace NameArray
 	{
 		inline int32 ChunksStart;
@@ -226,9 +272,10 @@ namespace Off
 		inline int32 ByteCursor;
 	}
 
+	/* FField and FFieldClass are all found by Off::Init() on an FProperty game; the values here are the
+	   4.25 layout and are never read before that, nor at all on a UProperty game. */
 	namespace FField
 	{
-		// Fixed for CasePreserving FNames by OffsetFinder::FixupHardcodedOffsets();
 		inline int32 Vft = 0x00;
 		inline int32 Class = 0x08;
 		inline int32 Owner = 0x10;
@@ -241,8 +288,6 @@ namespace Off
 
 	namespace FFieldClass
 	{
-		// Fixed for CasePreserving FNames by OffsetFinder::FixupHardcodedOffsets();
-		// Fixed for OutlineNumber FNames by OffsetFinder::FixFNameSize();
 		inline int32 Name = 0x00;
 		inline int32 Id = 0x08;
 		inline int32 CastFlags = 0x10; // 0x18 on UE5.7
@@ -252,7 +297,7 @@ namespace Off
 
 	namespace FName
 	{
-		// These values initialized by OffsetFinder::InitUObjectOffsets()
+		// Set by OffsetFinder::InitFNameSettings() and checked by PostInitFNameSettings()
 		inline int32 CompIdx = 0x0;
 		inline int32 Number = 0x4;
 	}
@@ -304,7 +349,7 @@ namespace Off
 		inline int32 ChildProperties;
 		inline int32 Size;
 		inline int32 MinAlignment;
-		inline int32 Script;                        // TArray<uint8> bytecode (BP-VM disassembler); MinAlignment+4 if no scripted fn to verify
+		inline int32 Script;                        // TArray<uint8> bytecode (BP-VM disassembler); -1 unless scripted functions confirm it
 		inline int32 StructBaseChainArray;          // FStructBaseChain** for O(1) IsChildOf; OffsetNotFound on pre-UE4.22
 		inline int32 NumStructBasesInChainMinusOne; // int32 sibling of StructBaseChainArray; only set when the chain was found
 	}
@@ -435,15 +480,11 @@ namespace Off
 
 namespace PropertySizes
 {
+	/* Measures each size below on a live property of its kind, and logs it. */
 	void Init();
 
 	/* These are properties for which their size might change depending on the UE version or compilerflags. */
 	inline int32 DelegateProperty = 0x10;
-	void InitTDelegateSize();
-
 	inline int32 FieldPathProperty = 0x20;
-	void InitFFieldPathSize();
-
 	inline int32 MulticastInlineDelegateProperty = 0x10;
-	void InitTMulticastInlineDelegateSize();
 }

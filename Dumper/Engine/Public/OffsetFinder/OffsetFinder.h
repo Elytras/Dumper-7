@@ -75,6 +75,20 @@ namespace OffsetFinder
 		return OffsetNotFound;
 	};
 
+	/* Whether Ptr is a live UObject: readable, and its own InternalIndex leads back to it in GObjects.
+	   The finders use it to accept a pointer they found only after this round trip, so a candidate offset
+	   that holds some other number is rejected instead of dereferenced as an object. */
+	bool IsLiveObject(const void* Ptr);
+
+	/* Whether Ptr is a property (FField, or UProperty before 4.25) whose owner is Owner - what an
+	   ArrayProperty's Inner, a MapProperty's key and an EnumProperty's underlying property all are. */
+	bool IsPropertyOwnedBy(const void* Ptr, const void* Owner);
+
+	/* Up to Max properties of one kind, from the structs in GObjects in index order: what the finders for a
+	   property kind's own members check their candidate slot against, and how Off::Init() tells a kind the
+	   game never uses from one whose layout wasn't found. */
+	std::vector<UEProperty> SampleProperties(EClassCastFlags Type, size_t Max);
+
 	/* UObject */
 	int32_t FindUObjectFlagsOffset();
 	int32_t FindUObjectIndexOffset();
@@ -84,20 +98,24 @@ namespace OffsetFinder
 
 	void FixupHardcodedOffsets();
 	void InitFNameSettings();
-	void PostInitFNameSettings();
+	bool PostInitFNameSettings();
 
 	/* UField */
 	int32_t FindUFieldNextOffset();
 
 	/* FField */
+	int32_t FindFFieldOwnerOffset();
 	int32_t FindFFieldNextOffset();
 	int32_t FindFFieldNameOffset();
 	int32_t NewFindFFieldNameOffset();
 	int32_t FindFFieldClassOffset();
+	int32_t FindFFieldFlagsOffset();
 	int32_t FindFFieldEditorOnlyMetaDataOffset();
 
 	/* FFieldClass */
 	int32_t FindFieldClassCastFlagsOffset();
+	int32_t FindFieldClassIdOffset();
+	int32_t FindFieldClassSuperClassOffset();
 
 	/* UEnum */
 	int32_t FindEnumNamesOffset();
@@ -126,27 +144,29 @@ namespace OffsetFinder
 	int32_t FindArrayDimOffset();
 	int32_t FindPropertyFlagsOffset();
 	int32_t FindOffsetInternalOffset();
+	int32 FindRepIndexOffset(int32 PropertyFlagsOffset, int32 OffsetInternalOffset);
+	int32 FindBlueprintReplicationConditionOffset(int32 RepIndexOffset);
+	int32 FindRepNotifyFuncOffset(int32 OffsetInternalOffset, int32 PropertySize);
 	int32 FindPropertyLinkNextOffset(int32 OffsetInternalOffset);
-	int32 FindRepNotifyFuncOffset(int32 OffsetInternalOffset, int32 PropertyLinkNextOffset);
+	int32 FindPropertyChainOffset(int32 PropertyLinkNextOffset, int32 ChainIndex);
 
-	/* Property (hardcoded, pending real discovery) */
-	int32 FindRepIndexOffset(int32 PropertySize);
-	int32 FindBlueprintReplicationConditionOffset(int32 PropertySize);
-	int32 FindNextRefOffset(int32 PropertySize);
-	int32 FindDestructorLinkNextOffset(int32 PropertySize);
-	int32 FindPostConstructLinkNextOffset(int32 PropertySize);
-
-	/* FieldPathProperty (hardcoded, pending real discovery) */
+	/* FieldPathProperty */
 	int32 FindFieldPathPropertyFieldClassOffset(int32 PropertySize);
 
-	/* OptionalProperty (hardcoded, pending real discovery) */
+	/* OptionalProperty */
 	int32 FindOptionalPropertyValuePropertyOffset(int32 PropertySize);
 
 	/* BoolProperty */
 	int32_t FindBoolPropertyBaseOffset();
 
 	/* ObjectProperty */
-	int32_t FindObjectPropertyClassOffset();
+	int32_t FindObjectPropertyClassOffset(int32 PropertySize);
+
+	/* ClassProperty */
+	int32_t FindClassPropertyMetaClassOffset(int32 PropertyClassOffset);
+
+	/* InterfaceProperty */
+	int32_t FindInterfacePropertyInterfaceClassOffset(int32 PropertySize);
 
 	/* EnumProperty */
 	int32_t FindEnumPropertyBaseOffset();
@@ -155,10 +175,13 @@ namespace OffsetFinder
 	int32_t FindBytePropertyEnumOffset();
 
 	/* StructProperty */
-	int32_t FindStructPropertyStructOffset();
+	int32_t FindStructPropertyStructOffset(int32 PropertySize);
 
 	/* DelegateProperty */
-	int32_t FindDelegatePropertySignatureFunctionOffset();
+	int32_t FindDelegatePropertySignatureFunctionOffset(int32 PropertySize);
+
+	/* MulticastDelegateProperty */
+	int32_t FindMulticastDelegatePropertySignatureFunctionOffset(int32 PropertySize);
 
 	/* ArrayProperty */
 	int32_t FindInnerTypeOffset(const int32 PropertySize);
@@ -174,4 +197,7 @@ namespace OffsetFinder
 
 	/* InSDK -> UDataTable */
 	int32_t FindDatatableRowMapOffset();
+
+	/* FUObjectItem */
+	int32 FindFUObjectItemFlagsOffset();
 }

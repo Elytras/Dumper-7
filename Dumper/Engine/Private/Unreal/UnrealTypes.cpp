@@ -320,6 +320,9 @@ std::wstring FName::ToRawWString() const
 	if (!Address)
 		return L"None";
 
+	if (!NameArray::IsValidCompIdx(GetCompIdx()))
+		return std::format(L"InvalidName_{:X}", static_cast<uint32>(GetCompIdx()));
+
 	return ToStr(Address);
 }
 

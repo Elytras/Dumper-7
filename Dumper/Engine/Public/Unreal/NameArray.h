@@ -45,6 +45,9 @@ private:
 
 	static inline void* (*ByIndex)(void* NamesArray, int32 ComparisonIndex, int32 NamePoolBlockOffsetBits) = nullptr;
 
+	/* Set once the table's extent is known and checked against every object name (see PostInit). */
+	static inline bool bBoundsKnown = false;
+
 private:
 	static bool InitializeNameArray(uint8_t* NameArray);
 	static bool InitializeNamePool(uint8_t* NamePool);
@@ -57,11 +60,17 @@ public:
 	static bool TryInit(bool bIsTestOnly = false);
 	static bool TryInit(int32 OffsetOverride, bool bIsNamePool, const char* const ModuleName = Settings::General::DefaultModuleName);
 
-	/* Initializes the GNames offset, but doesn't call NameArray::InitializeNameArray() or NameArray::InitializedNamePool() */
+	/* Finds the GNames offset without committing to read name strings from it (FName::AppendString does
+	   that). The table is still initialized when possible, for its bounds only - see IsValidCompIdx(). */
 	static bool SetGNamesWithoutCommitting();
 
 	static void PostInit();
-	
+
+	/* Whether a comparison index names an entry inside the name table. FName::ToRawWString() refuses an
+	   index that doesn't, which is what a name read at a wrong offset usually holds, instead of handing
+	   it to the engine's AppendString to follow into unmapped memory. True while the bounds are unknown. */
+	static bool IsValidCompIdx(int32 CompIdx);
+
 public:
 	static int32 GetNumChunks();
 

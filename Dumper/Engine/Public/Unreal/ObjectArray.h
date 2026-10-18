@@ -78,6 +78,9 @@ public:
 	template<typename UEType = UEObject>
 	static UEType GetByIndex(int32 Index);
 
+	/* The address of the FUObjectItem at Index (its Object slot), or nullptr past the end. */
+	static void* GetItemAddress(int32 Index);
+
 	template<typename UEType = UEObject>
 	static UEType FindObject(const std::string& FullName, EClassCastFlags RequiredType = EClassCastFlags::None);
 

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <format>
 #include <filesystem>
+#include <unordered_set>
 
 #include "Unreal/ObjectArray.h"
 #include "Unreal/GcKeep.h"
@@ -276,7 +277,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num())
 					return nullptr;
 
 				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
@@ -286,7 +287,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num())
 					return nullptr;
 
 				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
@@ -314,7 +315,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num())
 					return nullptr;
 
 				const int32 ChunkIndex = Index / PerChunk;
@@ -330,7 +331,7 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num())
 					return nullptr;
 
 				const int32 ChunkIndex = Index / PerChunk;
@@ -378,7 +379,7 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 
 	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num())
 			return nullptr;
 
 		uint8_t* ItemPtr = *reinterpret_cast<uint8_t**>(ObjectsArray) + (Index * FUObjectItemSize);
@@ -388,7 +389,7 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 
 	ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num())
 			return nullptr;
 
 		uint8_t* ItemPtr = *reinterpret_cast<uint8_t**>(ObjectsArray) + (Index * FUObjectItemSize);
@@ -416,7 +417,7 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 
 	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num())
 			return nullptr;
 
 		const int32 ChunkIndex = Index / PerChunk;
@@ -430,7 +431,7 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 
 	ItemAddrByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num())
 			return nullptr;
 
 		const int32 ChunkIndex = Index / PerChunk;
@@ -451,8 +452,8 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 
 /* Shared worker: OR RootSet onto items in [Begin, End), but ONLY for classes (BPGC) - and for each
    class, its package (Outer) and its CDO alongside it. EInternalObjectFlags::RootSet is engine-canonical
-   (1<<30), stable across UE4.27..UE5; FUObjectItem.Flags lives 8 bytes after the Object pointer
-   (FUObjectItem { UObjectBase* Object; int32 Flags; ... }).
+   (1<<30), stable across UE4.27..UE5; FUObjectItem.Flags lives right after the Object pointer
+   (FUObjectItem { UObjectBase* Object; int32 Flags; ... }), checked at init (Off::FUObjectItem::Flags).
 
    Deliberately narrow: rooting every live object (the old behavior) pins the whole world - actors,
    components, one-shot UI widgets - forever, which is what made the old "KeepObjectsAlive" mode
@@ -469,6 +470,9 @@ int32 ObjectArray::KeepRangeFromGC(int32 Begin, int32 End)
 	void* const ObjectsArray = GObjects + Off::FUObjectArray::GetObjectsOffset();
 	int32 Flagged = 0;
 
+	/* Stands in for the RootSet test below when FUObjectItem::Flags wasn't confirmed on this build. */
+	static std::unordered_set<void*> KeptWithoutFlags;
+
 	auto KeepIndex = [&](int32 Index) -> bool
 	{
 		void* const ItemSlot = ItemAddrByIndex(ObjectsArray, Index, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk);
@@ -479,11 +483,20 @@ int32 ObjectArray::KeepRangeFromGC(int32 Begin, int32 End)
 		if (!Object)
 			return false;
 
-		uint32* const Flags = reinterpret_cast<uint32*>(reinterpret_cast<uint8_t*>(ItemSlot) + sizeof(void*));
-		if (*Flags & RootSet)
-			return false; // already handled (e.g. shared package/CDO seen via an earlier class)
+		/* RootSet is written only where OffsetFinder::FindFUObjectItemFlagsOffset() confirmed the flags;
+		   otherwise the GcKeep reference below is the whole keep. */
+		if (Off::FUObjectItem::Flags != -1)
+		{
+			uint32* const Flags = reinterpret_cast<uint32*>(reinterpret_cast<uint8_t*>(ItemSlot) + Off::FUObjectItem::Flags);
+			if (*Flags & RootSet)
+				return false; // already handled (e.g. shared package/CDO seen via an earlier class)
 
-		*Flags |= RootSet;
+			*Flags |= RootSet;
+		}
+		else if (!GcKeep::IsAvailable() || !KeptWithoutFlags.insert(Object).second)
+		{
+			return false;
+		}
 
 		/* The real, unload-proof keep: a genuine FGCObject reference via the engine's own native
 		   Add/RemoveObject (auto-resolved in GcKeep::Init()). RootSet above is kept regardless as a
@@ -628,6 +641,11 @@ template<typename UEType>
 static UEType ObjectArray::GetByIndex(int32 Index)
 {
 	return UEType(ByIndex(GObjects + Off::FUObjectArray::GetObjectsOffset(), Index, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk));
+}
+
+void* ObjectArray::GetItemAddress(int32 Index)
+{
+	return ItemAddrByIndex ? ItemAddrByIndex(GObjects + Off::FUObjectArray::GetObjectsOffset(), Index, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk) : nullptr;
 }
 
 template<typename UEType>

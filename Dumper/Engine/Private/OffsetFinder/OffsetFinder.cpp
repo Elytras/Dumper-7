@@ -7,6 +7,118 @@
 
 #include "Platform.h"
 
+bool OffsetFinder::IsLiveObject(const void* Ptr)
+{
+	if (!Ptr || (reinterpret_cast<uintptr_t>(Ptr) & (alignof(void*) - 1)) != 0)
+		return false;
+
+	const uint8* const IndexSlot = static_cast<const uint8*>(Ptr) + Off::UObject::Index;
+	if (Platform::IsBadReadPtr(Ptr) || Platform::IsBadReadPtr(IndexSlot))
+		return false;
+
+	const int32 Index = *reinterpret_cast<const int32*>(IndexSlot);
+
+	return Index >= 0 && Index < ObjectArray::Num() && ObjectArray::GetByIndex(Index).GetAddress() == Ptr;
+}
+
+bool OffsetFinder::IsPropertyOwnedBy(const void* Ptr, const void* Owner)
+{
+	if (!Ptr || (reinterpret_cast<uintptr_t>(Ptr) & (alignof(void*) - 1)) != 0)
+		return false;
+
+	/* Before 4.25 a property is a UObject, and its owner is its Outer. */
+	if (!Settings::Internal::bUseFProperty)
+		return IsLiveObject(Ptr) && UEObject(const_cast<void*>(Ptr)).GetOuter().GetAddress() == Owner;
+
+	const uint8* const OwnerSlot = static_cast<const uint8*>(Ptr) + Off::FField::Owner;
+	if (Platform::IsBadReadPtr(Ptr) || Platform::IsBadReadPtr(OwnerSlot))
+		return false;
+
+	/* Since 5.1.1 FFieldVariant tags a UObject owner in the pointer's low bit instead of a bool. */
+	uintptr_t OwnerValue = *reinterpret_cast<const uintptr_t*>(OwnerSlot);
+	if (Settings::Internal::bUseMaskForFieldOwner)
+		OwnerValue &= ~static_cast<uintptr_t>(0x1);
+
+	return OwnerValue == reinterpret_cast<uintptr_t>(Owner);
+}
+
+/* Up to Max properties of one kind, from the structs in GObjects in index order. The finders for the
+   members a property subclass adds check their candidate slot against these. */
+static std::vector<UEProperty> SampleProperties(EClassCastFlags Type, size_t Max)
+{
+	std::vector<UEProperty> Samples;
+
+	for (UEObject Obj : ObjectArray())
+	{
+		if (!Obj.IsA(EClassCastFlags::Struct))
+			continue;
+
+		for (UEProperty Prop : Obj.Cast<UEStruct>().GetProperties())
+		{
+			if (!Prop.IsA(Type))
+				continue;
+
+			Samples.push_back(Prop);
+
+			if (Samples.size() == Max)
+				return Samples;
+		}
+	}
+
+	return Samples;
+}
+
+static const void* ReadPtr(const UEProperty& Prop, int32 Offset)
+{
+	return *reinterpret_cast<const void* const*>(static_cast<const uint8*>(Prop.GetAddress()) + Offset);
+}
+
+/* Whether every sample holds a live object of type ObjectType at Offset: how a property kind's own
+   UObject member (signature function, interface class, struct, ...) is told apart from whatever
+   happens to sit next to it. */
+static bool HoldObjectsOfType(const std::vector<UEProperty>& Samples, int32 Offset, EClassCastFlags ObjectType)
+{
+	if (Samples.empty() || Offset == OffsetFinder::OffsetNotFound)
+		return false;
+
+	return std::all_of(Samples.begin(), Samples.end(), [&](const UEProperty& Prop)
+	{
+		const void* Value = ReadPtr(Prop, Offset);
+		return OffsetFinder::IsLiveObject(Value) && UEObject(const_cast<void*>(Value)).IsA(ObjectType);
+	});
+}
+
+/* Where a property of kind Type keeps the NumSlots properties it wraps (an ArrayProperty's Inner, a
+   MapProperty's key and value, ...): the first slot from PropertySize on that holds, in every sample,
+   properties owned by the sample itself. Some games add a member in front of them, hence the second
+   candidate. */
+static int32 FindOwnedPropertySlot(EClassCastFlags Type, int32 PropertySize, int32 NumSlots)
+{
+	if (PropertySize == OffsetFinder::OffsetNotFound)
+		return OffsetFinder::OffsetNotFound;
+
+	const std::vector<UEProperty> Samples = SampleProperties(Type, 8);
+
+	for (int32 Offset = PropertySize; !Samples.empty() && Offset <= PropertySize + static_cast<int32>(sizeof(void*)); Offset += sizeof(void*))
+	{
+		const bool bAllOwned = std::all_of(Samples.begin(), Samples.end(), [&](const UEProperty& Prop)
+		{
+			for (int32 Slot = 0; Slot < NumSlots; Slot++)
+			{
+				if (!OffsetFinder::IsPropertyOwnedBy(ReadPtr(Prop, Offset + Slot * sizeof(void*)), Prop.GetAddress()))
+					return false;
+			}
+
+			return true;
+		});
+
+		if (bAllOwned)
+			return Offset;
+	}
+
+	return OffsetFinder::OffsetNotFound;
+}
+
 /* UObject */
 int32_t OffsetFinder::FindUObjectFlagsOffset()
 {
@@ -259,50 +371,38 @@ int32_t OffsetFinder::FindUObjectOuterOffset()
 	return LowestFoundOffset == 0xFFFF ? OffsetNotFound : LowestFoundOffset;
 }
 
+/*
+FFieldVariant, the FField::Owner member, is { void*, bool } (padded to 0x10) before 5.1.1 and a lone
+tagged pointer since. This decides which by looking at the slot right after the owner pointer of the
+first property of a few structs: with the bool it holds 0 or 1 and padding, without it it is FField::Next.
+Every struct named here declares more than one property, so that Next is never null and can't pass for
+a bool. Runs before FField::Next is known (its finder needs the answer), hence the first child only, and
+sets Settings::Internal::bUseMaskForFieldOwner, which IsPropertyOwnedBy also relies on.
+*/
 void OffsetFinder::FixupHardcodedOffsets()
 {
-	if (Settings::Internal::bUseCasePreservingName)
-	{
-		Off::FField::Flags += 0x8;
+	if (!Settings::Internal::bUseFProperty || Off::FField::Owner == OffsetNotFound)
+		return;
 
-		Off::FFieldClass::Id += 0x08;
-		Off::FFieldClass::CastFlags += 0x08;
-		Off::FFieldClass::ClassFlags += 0x08;
-		Off::FFieldClass::SuperClass += 0x08;
+	int32 NumChecked = 0;
+	int32 NumPointers = 0;
+
+	for (const char* StructName : { "Actor", "ActorComponent", "Pawn", "Guid", "Vector" })
+	{
+		const UEStruct Struct = ObjectArray::FindStructFast(StructName);
+		if (!Struct || !Struct.GetChildProperties())
+			continue;
+
+		const void* const SlotAfterOwner = static_cast<const uint8*>(Struct.GetChildProperties().GetAddress()) + Off::FField::Owner + sizeof(void*);
+		const void* const PossibleNext = *static_cast<void* const*>(SlotAfterOwner);
+
+		NumChecked++;
+		NumPointers += !Platform::IsBadReadPtr(PossibleNext) && (reinterpret_cast<uintptr_t>(PossibleNext) & 0x1) == 0;
 	}
 
-	if (Settings::Internal::bUseFProperty)
-	{
-		/*
-		* On versions below 5.1.1: class FFieldVariant { void*, bool } -> extends to { void*, bool, uint8[0x7] }
-		* ON versions since 5.1.1: class FFieldVariant { void* }
-		*
-		* Check:
-		* if FFieldVariant contains a bool, the memory at the bools offset will not be a valid pointer
-		* if FFieldVariant doesn't contain a bool, the memory at the bools offset will be the next member of FField, the Next ptr [valid]
-		*/
-
-		const int32 OffsetToCheck = Off::FField::Owner + 0x8;
-		void* PossibleNextPtrOrBool0 = *(void**)((uint8*)ObjectArray::FindClassFast("Actor").GetChildProperties().GetAddress() + OffsetToCheck);
-		void* PossibleNextPtrOrBool1 = *(void**)((uint8*)ObjectArray::FindClassFast("ActorComponent").GetChildProperties().GetAddress() + OffsetToCheck);
-		void* PossibleNextPtrOrBool2 = *(void**)((uint8*)ObjectArray::FindClassFast("Pawn").GetChildProperties().GetAddress() + OffsetToCheck);
-
-		auto IsValidPtr = [](void* a) -> bool
-			{
-				return !Platform::IsBadReadPtr(a) && (uintptr_t(a) & 0x1) == 0; // realistically, there wont be any pointers to unaligned memory
-			};
-
-		if (IsValidPtr(PossibleNextPtrOrBool0) && IsValidPtr(PossibleNextPtrOrBool1) && IsValidPtr(PossibleNextPtrOrBool2))
-		{
-			std::cerr << "Applying fix to hardcoded offsets \n" << std::endl;
-
-			Settings::Internal::bUseMaskForFieldOwner = true;
-
-			Off::FField::Next -= 0x08;
-			Off::FField::Name -= 0x08;
-			Off::FField::Flags -= 0x08;
-		}
-	}
+	Settings::Internal::bUseMaskForFieldOwner = NumChecked > 0 && NumPointers == NumChecked;
+	std::cerr << std::format("FFieldVariant: {} ({} of {} properties hold a pointer after the owner)\n",
+		Settings::Internal::bUseMaskForFieldOwner ? "tagged pointer, 5.1.1+" : "pointer + bool", NumPointers, NumChecked);
 }
 
 void OffsetFinder::InitFNameSettings()
@@ -383,18 +483,22 @@ void OffsetFinder::InitFNameSettings()
 	}
 }
 
-void OffsetFinder::PostInitFNameSettings()
+/* Cross-checks the FName layout InitFNameSettings() guessed against the size of a real NameProperty,
+   APlayerStart::PlayerStartTag, and corrects it. Returns false when that property isn't there to check
+   against, so the guess stands unverified. */
+bool OffsetFinder::PostInitFNameSettings()
 {
 	const UEClass PlayerStart = ObjectArray::FindClassFast("PlayerStart");
+	const UEProperty PlayerStartTag = PlayerStart ? PlayerStart.FindMember("PlayerStartTag", EClassCastFlags::NameProperty) : UEProperty(nullptr);
 
-	const int32 FNameSize = PlayerStart.FindMember("PlayerStartTag").GetSize();
+	if (!PlayerStartTag)
+		return false;
+
+	const int32 FNameSize = PlayerStartTag.GetSize();
 
 	/* Nothing to do for us, everything is fine! */
 	if (Off::InSDK::Name::FNameSize == FNameSize)
-		return;
-
-	/* We've used the wrong FNameSize to determine the offset of FField::Flags. Substract the old, wrong, size and add the new one.*/
-	Off::FField::Flags = (Off::FField::Flags - Off::InSDK::Name::FNameSize) + FNameSize;
+		return true;
 
 	const uint8* NameAddress = static_cast<const uint8*>(PlayerStart.GetFName().GetAddress());
 
@@ -435,28 +539,108 @@ void OffsetFinder::PostInitFNameSettings()
 		Off::FName::Number = 0x4;
 		Off::InSDK::Name::FNameSize = 0x8;
 	}
+
+	return true;
 }
 
 /* UField */
+
+/* UField::Next links a class's functions: the first function of KismetSystemLibrary and of
+   KismetStringLibrary each point there at another live function of the same class. */
 int32_t OffsetFinder::FindUFieldNextOffset()
 {
-	const void* KismetSystemLibraryChild = ObjectArray::FindObjectFast<UEStruct>("KismetSystemLibrary").GetChild().GetAddress();
-	const void* KismetStringLibraryChild = ObjectArray::FindObjectFast<UEStruct>("KismetStringLibrary").GetChild().GetAddress();
+	const UEStruct KismetSystemLibrary = ObjectArray::FindObjectFast<UEStruct>("KismetSystemLibrary");
+	const UEStruct KismetStringLibrary = ObjectArray::FindObjectFast<UEStruct>("KismetStringLibrary");
+
+	if (!KismetSystemLibrary || !KismetStringLibrary)
+		return OffsetNotFound;
+
+	const UEObject KismetSystemLibraryChild = KismetSystemLibrary.GetChild();
+	const UEObject KismetStringLibraryChild = KismetStringLibrary.GetChild();
+
+	if (!KismetSystemLibraryChild || !KismetStringLibraryChild)
+		return OffsetNotFound;
 
 #undef max
 	const auto HighestUObjectOffset = std::max({ Off::UObject::Index, Off::UObject::Name, Off::UObject::Flags, Off::UObject::Outer, Off::UObject::Class });
 #define max(a,b)            (((a) > (b)) ? (a) : (b))
 
-	return GetValidPointerOffset(KismetSystemLibraryChild, KismetStringLibraryChild, Align(HighestUObjectOffset + 0x4, static_cast<int>(sizeof(void*))), 0x60);
+	auto LinksToSibling = [](const UEObject& Child, int32 Offset)
+	{
+		void* const Next = *reinterpret_cast<void* const*>(static_cast<const uint8*>(Child.GetAddress()) + Offset);
+		return IsLiveObject(Next) && UEObject(Next).GetOuter() == Child.GetOuter();
+	};
+
+	for (int32 Offset = Align(HighestUObjectOffset + 0x4, static_cast<int>(sizeof(void*))); Offset <= 0x60; Offset += sizeof(void*))
+	{
+		if (LinksToSibling(KismetSystemLibraryChild, Offset) && LinksToSibling(KismetStringLibraryChild, Offset))
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
 /* FField */
+
+/* FField::Owner holds the object a property belongs to: for a struct's own members, the UScriptStruct
+   itself. So it is the slot after FField::ClassPrivate that points back at the struct, in every member
+   checked. The low bit is masked because 5.1.1+ tags a UObject owner there; pointers are 8-aligned, so
+   the mask changes nothing on older engines. */
+int32_t OffsetFinder::FindFFieldOwnerOffset()
+{
+	std::vector<std::pair<const uint8*, uintptr_t>> FieldsAndOwners;
+
+	for (const char* StructName : { "Guid", "Vector", "Color" })
+	{
+		const UEStruct Struct = ObjectArray::FindStructFast(StructName);
+		if (Struct && Struct.GetChildProperties())
+			FieldsAndOwners.emplace_back(static_cast<const uint8*>(Struct.GetChildProperties().GetAddress()), reinterpret_cast<uintptr_t>(Struct.GetAddress()));
+	}
+
+	if (FieldsAndOwners.size() < 2)
+		return OffsetNotFound;
+
+	for (int32 Offset = Off::FField::Class + sizeof(void*); Offset <= 0x30; Offset += sizeof(void*))
+	{
+		const bool bAllPointBack = std::all_of(FieldsAndOwners.begin(), FieldsAndOwners.end(), [Offset](const auto& FieldAndOwner)
+		{
+			const uintptr_t Value = *reinterpret_cast<const uintptr_t*>(FieldAndOwner.first + Offset);
+			return (Value & ~static_cast<uintptr_t>(0x1)) == FieldAndOwner.second;
+		});
+
+		if (bAllPointBack)
+			return Offset;
+	}
+
+	return OffsetNotFound;
+}
+
+/* FField::Next follows FFieldVariant, which is one tagged pointer since 5.1.1 and a pointer plus a
+   padded bool before. The first member of FGuid and of FVector links there to another member of its
+   own struct. */
 int32_t OffsetFinder::FindFFieldNextOffset()
 {
-	const void* GuidChildren = ObjectArray::FindStructFast("Guid").GetChildProperties().GetAddress();
-	const void* VectorChildren = ObjectArray::FindStructFast("Vector").GetChildProperties().GetAddress();
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+	const UEStruct Vector = ObjectArray::FindStructFast("Vector");
 
-	return GetValidPointerOffset(GuidChildren, VectorChildren, Off::FField::Owner + 0x8, 0x48);
+	if (!Guid || !Vector || !Guid.GetChildProperties() || !Vector.GetChildProperties() || Off::FField::Owner == OffsetNotFound)
+		return OffsetNotFound;
+
+	const int32 FFieldVariantSize = Settings::Internal::bUseMaskForFieldOwner ? sizeof(void*) : 2 * sizeof(void*);
+
+	auto LinksToSibling = [](const UEStruct& Struct, int32 Offset)
+	{
+		const uint8* const FirstMember = static_cast<const uint8*>(Struct.GetChildProperties().GetAddress());
+		return IsPropertyOwnedBy(*reinterpret_cast<void* const*>(FirstMember + Offset), Struct.GetAddress());
+	};
+
+	for (int32 Offset = Off::FField::Owner + FFieldVariantSize; Offset <= 0x48; Offset += sizeof(void*))
+	{
+		if (LinksToSibling(Guid, Offset) && LinksToSibling(Vector, Offset))
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
 int32_t OffsetFinder::FindFFieldNameOffset()
@@ -584,12 +768,34 @@ int32_t OffsetFinder::FindFFieldEditorOnlyMetaDataOffset()
 	return OffsetNotFound;
 }
 
+/* FField::ClassPrivate points at a static FFieldClass inside the module. The first members of FGuid and
+   FIntPoint are both IntProperty, so they hold the same pointer there, and FColor's (a ByteProperty)
+   holds another; the owner slot next to it points at three different structs. */
 int32_t OffsetFinder::FindFFieldClassOffset()
 {
-	const UEFField GuidChild = ObjectArray::FindStructFast("Guid").GetChildProperties();
-	const UEFField VectorChild = ObjectArray::FindStructFast("Vector").GetChildProperties();
+	const uint8* Members[3] = {};
+	const char* const StructNames[3] = { "Guid", "IntPoint", "Color" };
 
-	return GetValidPointerOffset<false>(GuidChild.GetAddress(), VectorChild.GetAddress(), 0x8, 0x30, true);
+	for (int i = 0; i < 3; i++)
+	{
+		const UEStruct Struct = ObjectArray::FindStructFast(StructNames[i]);
+		Members[i] = Struct ? static_cast<const uint8*>(Struct.GetChildProperties().GetAddress()) : nullptr;
+
+		if (!Members[i])
+			return OffsetNotFound;
+	}
+
+	for (int32 Offset = sizeof(void*); Offset <= 0x30; Offset += sizeof(void*))
+	{
+		const void* const IntClass = *reinterpret_cast<void* const*>(Members[0] + Offset);
+		const void* const ByteClass = *reinterpret_cast<void* const*>(Members[2] + Offset);
+
+		if (IntClass && IntClass == *reinterpret_cast<void* const*>(Members[1] + Offset) && IntClass != ByteClass
+			&& Platform::IsAddressInProcessRange(IntClass) && Platform::IsAddressInProcessRange(ByteClass))
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
 // This function assumes that the EnumObj passed in is valid and that the values of the enum are starting at 0
@@ -648,19 +854,71 @@ void InializeUEnumSettings(const void* EnumObj, const uint32_t UEnumNumValuesOff
 }
 
 /* FFieldClass */
+
+/* The field classes of an IntProperty (FGuid's first member) and a ByteProperty (FColor's), which every
+   FFieldClass finder below reads. */
+static std::pair<uint8*, uint8*> IntAndByteFieldClasses()
+{
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+	const UEStruct Color = ObjectArray::FindStructFast("Color");
+
+	if (!Guid || !Color || !Guid.GetChildProperties() || !Color.GetChildProperties())
+		return { nullptr, nullptr };
+
+	return { static_cast<uint8*>(Guid.GetChildProperties().GetClass().GetAddress()), static_cast<uint8*>(Color.GetChildProperties().GetClass().GetAddress()) };
+}
+
 int32_t OffsetFinder::FindFieldClassCastFlagsOffset()
 {
+	const auto [IntClass, ByteClass] = IntAndByteFieldClasses();
+
+	if (!IntClass || !ByteClass)
+		return OffsetNotFound;
+
 	std::vector<std::pair<void*, EClassCastFlags>> Infos;
+	Infos.push_back({ IntClass,  EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::IntProperty  });
+	Infos.push_back({ ByteClass, EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::ByteProperty });
 
-	const UEFField GuidChild = ObjectArray::FindStructFast("Guid").GetChildProperties();
-	const UEFField ColourChild = ObjectArray::FindStructFast("Color").GetChildProperties();
+	return FindOffset(Infos, sizeof(void*), 0x30);
+}
 
-	Infos.push_back({ GuidChild.GetClass().GetAddress(),   EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::IntProperty  });
-	Infos.push_back({ ColourChild.GetClass().GetAddress(), EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::ByteProperty });
+/* FFieldClass::Id is the class's own cast-flag bit (DECLARE_FIELD's StaticClassCastFlagsPrivate), and
+   comes before CastFlags, which holds that bit together with all of its supers'. */
+int32_t OffsetFinder::FindFieldClassIdOffset()
+{
+	const auto [IntClass, ByteClass] = IntAndByteFieldClasses();
 
-	const int32_t Offset = FindOffset(Infos, sizeof(void*), 0x30);
+	if (!IntClass || !ByteClass || Off::FFieldClass::CastFlags == OffsetNotFound)
+		return OffsetNotFound;
 
-	return Offset != OffsetNotFound ? Offset : 0x10;
+	std::vector<std::pair<void*, EClassCastFlags>> Infos;
+	Infos.push_back({ IntClass, EClassCastFlags::IntProperty });
+	Infos.push_back({ ByteClass, EClassCastFlags::ByteProperty });
+
+	return FindOffset(Infos, sizeof(void*), Off::FFieldClass::CastFlags);
+}
+
+/* IntProperty and ByteProperty both derive from NumericProperty: SuperClass is the slot after CastFlags
+   where both field classes point at the same FFieldClass, one whose own Id is NumericProperty's bit. */
+int32_t OffsetFinder::FindFieldClassSuperClassOffset()
+{
+	const auto [IntClass, ByteClass] = IntAndByteFieldClasses();
+
+	if (!IntClass || !ByteClass || Off::FFieldClass::CastFlags == OffsetNotFound || Off::FFieldClass::Id == OffsetNotFound)
+		return OffsetNotFound;
+
+	for (int32 Offset = Off::FFieldClass::CastFlags + sizeof(uint64); Offset <= Off::FFieldClass::CastFlags + 0x20; Offset += sizeof(void*))
+	{
+		const uint8* const Super = *reinterpret_cast<const uint8* const*>(IntClass + Offset);
+
+		if (!Super || Super != *reinterpret_cast<const uint8* const*>(ByteClass + Offset) || Platform::IsBadReadPtr(Super + Off::FFieldClass::Id))
+			continue;
+
+		if (*reinterpret_cast<const EClassCastFlags*>(Super + Off::FFieldClass::Id) == EClassCastFlags::NumericProperty)
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
 /* UEnum */
@@ -680,6 +938,9 @@ int32_t OffsetFinder::FindEnumNamesOffset()
 
 		UEnumNumValuesOffset = FindOffset(Infos);
 	}
+
+	if (UEnumNumValuesOffset == OffsetNotFound)
+		return OffsetNotFound;
 
 	InializeUEnumSettings(Infos[0].first, UEnumNumValuesOffset);
 
@@ -786,14 +1047,18 @@ int32_t OffsetFinder::FindScriptOffset()
 	   UE4.15-5.x. Derive from the binary-found MinAlignment anchor, then VERIFY the TArray shape against a real
 	   scripted UFunction that actually carries bytecode (Data readable, 0 < Num <= Max). Dumper-7 did not emit
 	   this before; the BP-VM disassembler needs it. */
-	const int32 Candidate = Off::UStruct::MinAlignment + static_cast<int32>(sizeof(int32));
+	if (Off::UStruct::MinAlignment == OffsetNotFound)
+		return OffsetNotFound;
 
-	const int32 NumObjects = ObjectArray::Num();
-	for (int32 i = 0; i < NumObjects; i++)
+	const int32 Candidate = Align(Off::UStruct::MinAlignment + static_cast<int32>(sizeof(int32)), static_cast<int32>(sizeof(void*)));
+
+	/* A native function has no bytecode, so its array there must be empty; at least one scripted one
+	   must hold a real array. */
+	bool bFoundBytecode = false;
+
+	for (UEObject Obj : ObjectArray())
 	{
-		UEObject Obj = ObjectArray::GetByIndex(i);
-
-		if (Obj.GetAddress() == nullptr || !Obj.IsA(EClassCastFlags::Function))
+		if (!Obj.IsA(EClassCastFlags::Function))
 			continue;
 
 		const uint8* const Addr = static_cast<const uint8*>(Obj.GetAddress());
@@ -801,11 +1066,18 @@ int32_t OffsetFinder::FindScriptOffset()
 		const int32 ScriptNum = *reinterpret_cast<const int32*>(Addr + Candidate + 0x08);
 		const int32 ScriptMax = *reinterpret_cast<const int32*>(Addr + Candidate + 0x0C);
 
-		if (ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData))
-			return Candidate; // verified against a real bytecode array
+		if (Obj.Cast<UEFunction>().HasFlags(EFunctionFlags::Native))
+		{
+			if (ScriptNum != 0)
+				return OffsetNotFound;
+
+			continue;
+		}
+
+		bFoundBytecode = bFoundBytecode || (ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData));
 	}
 
-	return Candidate; // no scripted function found to verify against -> fall back to the anchor-derived offset
+	return bFoundBytecode ? Candidate : OffsetNotFound;
 }
 
 int32_t OffsetFinder::FindStructBaseChainOffset()
@@ -903,6 +1175,9 @@ int32_t OffsetFinder::FindFunctionNativeFuncOffset()
 	if (SwitchLevel_Or_FOV == NULL)
 		SwitchLevel_Or_FOV = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("FOV", EClassCastFlags::Function).GetAddress());
 
+	if (!WasInputKeyJustPressed || !ToggleSpeaking || !SwitchLevel_Or_FOV)
+		return OffsetNotFound;
+
 	for (int i = 0x30; i < 0x140; i += sizeof(void*))
 	{
 		if (Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(WasInputKeyJustPressed + i)) &&
@@ -910,7 +1185,7 @@ int32_t OffsetFinder::FindFunctionNativeFuncOffset()
 			return i;
 	}
 
-	return 0x0;
+	return OffsetNotFound;
 }
 
 /* UClass */
@@ -1043,11 +1318,14 @@ int32_t OffsetFinder::FindBoolPropertyBaseOffset()
 	Infos.push_back({ Engine.FindMember("bEnableOnScreenDebugMessagesDisplay").GetAddress(), 0b00000010 });
 	Infos.push_back({ ObjectArray::FindClassFast("PlayerController").FindMember("bAutoManageActiveCameraTarget").GetAddress(), 0xFF });
 
-	return (FindOffset<1>(Infos, Off::Property::Offset_Internal) - 0x3);
+	/* The match is FieldMask, the last of the four bytes. */
+	const int32 FieldMaskOffset = FindOffset<1>(Infos, Off::Property::Offset_Internal);
+
+	return FieldMaskOffset != OffsetNotFound ? FieldMaskOffset - 0x3 : OffsetNotFound;
 }
 
 /* ObjectPrperty */
-int32_t OffsetFinder::FindObjectPropertyClassOffset()
+int32_t OffsetFinder::FindObjectPropertyClassOffset(int32 PropertySize)
 {
 	std::vector<std::pair<void*, void*>> Infos;
 
@@ -1056,7 +1334,14 @@ int32_t OffsetFinder::FindObjectPropertyClassOffset()
 	Infos.push_back({ Controller.FindMember("Pawn").GetAddress(), ObjectArray::FindClassFast("Pawn").GetAddress() });
 	Infos.push_back({ ObjectArray::FindClassFast("World").FindMember("PersistentLevel").GetAddress(), ObjectArray::FindClassFast("Level").GetAddress() });
 
-	return FindOffset(Infos, Off::Property::Offset_Internal);
+	const int32 Offset = FindOffset(Infos, Off::Property::Offset_Internal);
+
+	if (Offset != OffsetNotFound)
+		return Offset;
+
+	/* PropertyClass is the first member FObjectPropertyBase adds, so it sits at PropertySize when it holds
+	   a class in every ObjectProperty sampled. */
+	return HoldObjectsOfType(SampleProperties(EClassCastFlags::ObjectProperty, 8), PropertySize, EClassCastFlags::Class) ? PropertySize : OffsetNotFound;
 }
 
 /* EnumProperty */
@@ -1081,7 +1366,21 @@ int32_t OffsetFinder::FindEnumPropertyBaseOffset()
 	Infos.push_back({ AutoPossessAIMember , AutoPossessAI });
 
 	// EnumProperty::Enum is the 2nd member after 'NumericProperty UnderlyingType'
-	return FindOffset(Infos, Off::Property::Offset_Internal) - sizeof(void*);
+	const int32 EnumOffset = FindOffset(Infos, Off::Property::Offset_Internal);
+
+	if (EnumOffset == OffsetNotFound)
+		return OffsetNotFound;
+
+	/* ...and that UnderlyingType is a property owned by the EnumProperty itself. */
+	const int32 Base = EnumOffset - sizeof(void*);
+
+	for (const void* Member : { CreationMethodMember, AutoPossessAIMember })
+	{
+		if (!IsPropertyOwnedBy(*reinterpret_cast<void* const*>(static_cast<const uint8*>(Member) + Base), Member))
+			return OffsetNotFound;
+	}
+
+	return Base;
 }
 
 /* ByteProperty */
@@ -1109,7 +1408,7 @@ int32_t OffsetFinder::FindBytePropertyEnumOffset()
 }
 
 /* StructProperty */
-int32_t OffsetFinder::FindStructPropertyStructOffset()
+int32_t OffsetFinder::FindStructPropertyStructOffset(int32 PropertySize)
 {
 	std::vector<std::pair<void*, const void*>> Infos;
 
@@ -1120,109 +1419,122 @@ int32_t OffsetFinder::FindStructPropertyStructOffset()
 
 	const UEStruct TwoVectorsStruct = ObjectArray::FindStructFast("TwoVectors");
 
-	if (!VectorClass || !TwoVectorsStruct)
-		return OffsetNotFound;
+	const void* v1 = TwoVectorsStruct ? TwoVectorsStruct.FindMember("v1", EClassCastFlags::StructProperty).GetAddress() : nullptr;
+	const void* v2 = TwoVectorsStruct ? TwoVectorsStruct.FindMember("v2", EClassCastFlags::StructProperty).GetAddress() : nullptr;
 
-	const void* v1 = TwoVectorsStruct.FindMember("v1", EClassCastFlags::StructProperty).GetAddress();
-	const void* v2 = TwoVectorsStruct.FindMember("v2", EClassCastFlags::StructProperty).GetAddress();
+	if (VectorClass && v1 && v2)
+	{
+		Infos.push_back({ const_cast<void*>(v1), VectorClass });
+		Infos.push_back({ const_cast<void*>(v2), VectorClass });
 
-	if (!v1 || !v2)
-		return OffsetNotFound;
+		if (const int32 Offset = FindOffset(Infos, Off::Property::Offset_Internal); Offset != OffsetNotFound)
+			return Offset;
+	}
 
-	Infos.push_back({ const_cast<void*>(v1), VectorClass });
-	Infos.push_back({ const_cast<void*>(v2), VectorClass });
-
-	return FindOffset(Infos, Off::Property::Offset_Internal);
+	/* Struct is the first member FStructProperty adds. */
+	return HoldObjectsOfType(SampleProperties(EClassCastFlags::StructProperty, 8), PropertySize, EClassCastFlags::Struct) ? PropertySize : OffsetNotFound;
 }
 
 /* DelegateProperty */
-int32_t OffsetFinder::FindDelegatePropertySignatureFunctionOffset()
+int32_t OffsetFinder::FindDelegatePropertySignatureFunctionOffset(int32 PropertySize)
 {
 	std::vector<std::pair<void*, const void*>> Infos;
 
 	const void* DelegateSignature = ObjectArray::FindObjectFast("TimerDynamicDelegate__DelegateSignature", EClassCastFlags::Function).GetAddress();
 
-	const UEStruct TwoVectorsStruct = ObjectArray::FindStructFast("TwoVectors");
+	const UEFunction ElapsedTime = ObjectArray::FindObjectFast<UEFunction>("K2_GetTimerElapsedTimeDelegate", EClassCastFlags::Function);
+	const UEFunction RemainingTime = ObjectArray::FindObjectFast<UEFunction>("K2_GetTimerRemainingTimeDelegate", EClassCastFlags::Function);
 
-	if (!DelegateSignature || !TwoVectorsStruct)
-		return OffsetNotFound;
+	const void* Delegate1 = ElapsedTime ? ElapsedTime.FindMember("Delegate", EClassCastFlags::DelegateProperty).GetAddress() : nullptr;
+	const void* Delegate2 = RemainingTime ? RemainingTime.FindMember("Delegate", EClassCastFlags::DelegateProperty).GetAddress() : nullptr;
 
-	const void* Delegate1 = ObjectArray::FindObjectFast<UEFunction>("K2_GetTimerElapsedTimeDelegate", EClassCastFlags::Function).FindMember("Delegate", EClassCastFlags::DelegateProperty).GetAddress();
-	const void* Delegate2 = ObjectArray::FindObjectFast<UEFunction>("K2_GetTimerRemainingTimeDelegate", EClassCastFlags::Function).FindMember("Delegate", EClassCastFlags::DelegateProperty).GetAddress();
+	if (DelegateSignature && Delegate1 && Delegate2)
+	{
+		Infos.push_back({ const_cast<void*>(Delegate1), DelegateSignature });
+		Infos.push_back({ const_cast<void*>(Delegate2), DelegateSignature });
 
-	if (!Delegate1 || !Delegate2)
-		return OffsetNotFound;
+		if (const int32 Offset = FindOffset(Infos, Off::Property::Offset_Internal); Offset != OffsetNotFound)
+			return Offset;
+	}
 
-	Infos.push_back({ const_cast<void*>(Delegate1), DelegateSignature });
-	Infos.push_back({ const_cast<void*>(Delegate2), DelegateSignature });
-
-	return FindOffset(Infos, Off::Property::Offset_Internal);
+	/* SignatureFunction is the first member FDelegateProperty adds. */
+	return HoldObjectsOfType(SampleProperties(EClassCastFlags::DelegateProperty, 8), PropertySize, EClassCastFlags::Function) ? PropertySize : OffsetNotFound;
 }
 
 /* ArrayProperty */
 int32_t OffsetFinder::FindInnerTypeOffset(const int32 PropertySize)
 {
-	if (!Settings::Internal::bUseFProperty)
-		return PropertySize;
-
-	if (const UEProperty Property = ObjectArray::FindClassFast("GameViewportClient").FindMember("DebugProperties", EClassCastFlags::ArrayProperty))
-	{
-		void* AddressToCheck = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8*>(Property.GetAddress()) + PropertySize);
-
-		if (Platform::IsBadReadPtr(AddressToCheck))
-			return PropertySize + sizeof(void*);
-	}
-
-	return PropertySize;
+	return FindOwnedPropertySlot(EClassCastFlags::ArrayProperty, PropertySize, 1);
 }
 
 /* SetProperty */
 int32_t OffsetFinder::FindSetPropertyBaseOffset(const int32 PropertySize)
 {
-	if (!Settings::Internal::bUseFProperty)
-		return PropertySize;
-
-	if (const auto Object = ObjectArray::FindStructFast("LevelCollection").FindMember("Levels", EClassCastFlags::SetProperty))
-	{
-		const void* AddressToCheck = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8*>(Object.GetAddress()) + PropertySize);
-
-		if (Platform::IsBadReadPtr(AddressToCheck))
-			return PropertySize + sizeof(void*);
-	}
-
-	return PropertySize;
+	return FindOwnedPropertySlot(EClassCastFlags::SetProperty, PropertySize, 1);
 }
 
-
-/* MapProperty */
+/* MapProperty: the key property, with the value property right behind it. */
 int32_t OffsetFinder::FindMapPropertyBaseOffset(const int32 PropertySize)
 {
-	if (!Settings::Internal::bUseFProperty)
-		return PropertySize;
-
-	if (const auto Object = ObjectArray::FindClassFast("UserDefinedEnum").FindMember("DisplayNameMap", EClassCastFlags::MapProperty))
-	{
-		const void* AddressToCheck = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8*>(Object.GetAddress()) + PropertySize);
-
-		if (Platform::IsBadReadPtr(AddressToCheck))
-			return PropertySize + sizeof(void*);
-	}
-
-	return PropertySize;
+	return FindOwnedPropertySlot(EClassCastFlags::MapProperty, PropertySize, 2);
 }
 
 /*
- * TODO: replace each stub body with a real pattern-scan or FindOffset() call.
- */
-
-int32 OffsetFinder::FindRepIndexOffset(const int32 PropertyFlagsOffset)
+RepIndex (uint16) and BlueprintReplicationCondition (uint8) are all that sits between PropertyFlags and
+Offset_Internal on 4.25 through 5.6; an editor build adds IndexInOwner there, which the gap check
+refuses. The engine numbers RepIndex only for replicated (CPF_Net) properties and leaves it 0 on the
+rest, which is what Actor's other properties are checked for.
+*/
+int32 OffsetFinder::FindRepIndexOffset(int32 PropertyFlagsOffset, int32 OffsetInternalOffset)
 {
-	return PropertyFlagsOffset + sizeof(uint64);
+	if (PropertyFlagsOffset == OffsetNotFound || OffsetInternalOffset == OffsetNotFound)
+		return OffsetNotFound;
+
+	const int32 Candidate = PropertyFlagsOffset + sizeof(uint64);
+
+	if (OffsetInternalOffset - Candidate != sizeof(uint32))
+		return OffsetNotFound;
+
+	const UEClass Actor = ObjectArray::FindClassFast("Actor");
+	if (!Actor)
+		return OffsetNotFound;
+
+	int32 NumChecked = 0;
+
+	for (const UEProperty& Prop : Actor.GetProperties())
+	{
+		if (Prop.HasPropertyFlags(EPropertyFlags::Net))
+			continue;
+
+		if (*reinterpret_cast<const uint16*>(static_cast<const uint8*>(Prop.GetAddress()) + Candidate) != 0)
+			return OffsetNotFound;
+
+		NumChecked++;
+	}
+
+	return NumChecked > 0 ? Candidate : OffsetNotFound;
 }
 
-int32 OffsetFinder::FindBlueprintReplicationConditionOffset(const int32 RepIndexOffset)
+/* The ELifetimeCondition right after RepIndex: below COND_Max, which is under 0x20 on every version,
+   for all of Actor's properties. */
+int32 OffsetFinder::FindBlueprintReplicationConditionOffset(int32 RepIndexOffset)
 {
-	return RepIndexOffset + sizeof(uint16);
+	if (RepIndexOffset == OffsetNotFound)
+		return OffsetNotFound;
+
+	const int32 Candidate = RepIndexOffset + sizeof(uint16);
+	const UEClass Actor = ObjectArray::FindClassFast("Actor");
+
+	if (!Actor)
+		return OffsetNotFound;
+
+	for (const UEProperty& Prop : Actor.GetProperties())
+	{
+		if (*(static_cast<const uint8*>(Prop.GetAddress()) + Candidate) >= 0x20)
+			return OffsetNotFound;
+	}
+
+	return Candidate;
 }
 
 /*
@@ -1271,30 +1583,124 @@ int32 OffsetFinder::FindPropertyLinkNextOffset(const int32 OffsetInternalOffset)
 	return OffsetNotFound;
 }
 
-/* UE4 keeps RepNotifyFunc between Offset_Internal and PropertyLinkNext; UE5 puts it after the four link pointers. */
-int32 OffsetFinder::FindRepNotifyFuncOffset(const int32 OffsetInternalOffset, const int32 PropertyLinkNextOffset)
+/*
+RepNotifyFunc names the function the engine calls when a replicated property changes, and is None on
+every other property. UE4 keeps it right behind Offset_Internal, UE5 behind the four link pointers; the
+scan covers both. The slot is the one where every RepNotify property of the classes below names a
+function of its class or a super, and every other property holds None - compared as name indices, so
+no name is looked up while the offset is still a guess.
+*/
+struct FNameKey
 {
-	const int32 UE4Slot = OffsetInternalOffset + sizeof(int32);
+	int32 CompIdx;
+	uint32 Number;
 
-	if (PropertyLinkNextOffset >= UE4Slot + Off::InSDK::Name::FNameSize)
-		return UE4Slot;
+	bool operator==(const FNameKey&) const = default;
+};
 
-	return PropertyLinkNextOffset + 4 * sizeof(void*);
+int32 OffsetFinder::FindRepNotifyFuncOffset(int32 OffsetInternalOffset, int32 PropertySize)
+{
+	if (OffsetInternalOffset == OffsetNotFound || PropertySize == OffsetNotFound)
+		return OffsetNotFound;
+
+	auto ReadName = [](const void* Address) -> FNameKey
+	{
+		const FName Name(Address);
+		return { Name.GetCompIdx(), Name.GetNumber() };
+	};
+
+	/* Each class's own properties, with the names of the functions it and its supers declare. */
+	std::vector<std::pair<std::vector<UEProperty>, std::vector<FNameKey>>> Classes;
+
+	for (const char* ClassName : { "Actor", "Pawn", "Character", "Controller", "PlayerState" })
+	{
+		const UEClass Class = ObjectArray::FindClassFast(ClassName);
+		if (!Class)
+			continue;
+
+		std::vector<FNameKey> Functions;
+
+		for (UEStruct Struct = Class; Struct; Struct = Struct.GetSuper())
+		{
+			for (const UEFunction& Func : Struct.GetFunctions())
+				Functions.push_back(ReadName(Func.GetFName().GetAddress()));
+		}
+
+		Classes.emplace_back(Class.GetProperties(), std::move(Functions));
+	}
+
+	for (int32 Offset = Align(OffsetInternalOffset + static_cast<int32>(sizeof(int32)), 0x4); Offset + Off::InSDK::Name::FNameSize <= PropertySize; Offset += 0x4)
+	{
+		int32 NumNotifies = 0;
+		bool bMatches = true;
+
+		for (const auto& [Properties, Functions] : Classes)
+		{
+			for (const UEProperty& Prop : Properties)
+			{
+				const FNameKey Value = ReadName(static_cast<const uint8*>(Prop.GetAddress()) + Offset);
+
+				if (!Prop.HasPropertyFlags(EPropertyFlags::RepNotify))
+				{
+					bMatches = bMatches && Value == FNameKey{ 0, 0 };
+					continue;
+				}
+
+				bMatches = bMatches && std::find(Functions.begin(), Functions.end(), Value) != Functions.end();
+				NumNotifies++;
+			}
+		}
+
+		if (bMatches && NumNotifies >= 2)
+			return Offset;
+	}
+
+	return OffsetNotFound;
 }
 
-int32 OffsetFinder::FindNextRefOffset(const int32 PropertyLinkNextOffset)
+/*
+NextRef, DestructorLinkNext and PostConstructLinkNext follow PropertyLinkNext (ChainIndex 1, 2 and 3) on
+4.25 through 5.6. Each links the properties of a struct that need one kind of handling (UStruct::Link):
+object references, destruction - left to the native destructor in a native class, so a USTRUCT is
+sampled - and CDO copies after construction, which a native class does for its config properties.
+In the sample, the slot is null or points at another property of the same struct, at least once; in
+FGuid, whose four ints need none of the three, it is null.
+*/
+int32 OffsetFinder::FindPropertyChainOffset(int32 PropertyLinkNextOffset, int32 ChainIndex)
 {
-	return PropertyLinkNextOffset + sizeof(void*);
-}
+	if (PropertyLinkNextOffset == OffsetNotFound)
+		return OffsetNotFound;
 
-int32 OffsetFinder::FindDestructorLinkNextOffset(const int32 NextRefOffset)
-{
-	return NextRefOffset + sizeof(void*);
-}
+	const int32 Offset = PropertyLinkNextOffset + ChainIndex * static_cast<int32>(sizeof(void*));
 
-int32 OffsetFinder::FindPostConstructLinkNextOffset(const int32 DestructorLinkNextOffset)
-{
-	return DestructorLinkNextOffset + sizeof(void*);
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+	const UEStruct Sample = ObjectArray::FindStructFast(ChainIndex == 2 ? "URL" : "Engine");
+
+	if (!Guid || !Sample)
+		return OffsetNotFound;
+
+	for (const UEProperty& Prop : Guid.GetProperties())
+	{
+		if (ReadPtr(Prop, Offset) != nullptr)
+			return OffsetNotFound;
+	}
+
+	int32 NumLinks = 0;
+
+	for (const UEProperty& Prop : Sample.GetProperties())
+	{
+		const void* const Next = ReadPtr(Prop, Offset);
+
+		if (!Next)
+			continue;
+
+		if (!IsPropertyOwnedBy(Next, Sample.GetAddress()))
+			return OffsetNotFound;
+
+		NumLinks++;
+	}
+
+	return NumLinks > 0 ? Offset : OffsetNotFound;
 }
 
 /* InSDK -> ULevel */
@@ -1355,38 +1761,153 @@ int32 OffsetFinder::FindLevelActorsOffset()
 }
 
 
-/* InSDK -> UDataTable */
+/* InSDK -> UDataTable: RowMap follows the reflected RowStruct pointer. */
 int32 OffsetFinder::FindDatatableRowMapOffset()
 {
 	const UEClass DataTable = ObjectArray::FindClassFast("DataTable");
-
-	constexpr int32 UObjectOuterSize = sizeof(void*);
-	constexpr int32 RowStructSize = sizeof(void*);
-
-	if (!DataTable)
-	{
-		std::cerr << "\nDumper-7: [DataTable] Couldn't find \"DataTable\" class, assuming default layout.\n" << std::endl;
-		return (Off::UObject::Outer + UObjectOuterSize + RowStructSize);
-	}
-
-	UEProperty RowStructProp = DataTable.FindMember("RowStruct", EClassCastFlags::ObjectProperty);
+	const UEProperty RowStructProp = DataTable ? DataTable.FindMember("RowStruct", EClassCastFlags::ObjectProperty) : UEProperty(nullptr);
 
 	if (!RowStructProp)
-	{
-		std::cerr << "\nDumper-7: [DataTable] Couldn't find \"RowStruct\" property, assuming default layout.\n" << std::endl;
-		return (Off::UObject::Outer + UObjectOuterSize + RowStructSize);
-	}
+		return OffsetNotFound;
 
 	return RowStructProp.GetOffset() + RowStructProp.GetSize();
 }
 
-/* FieldPathProperty (hardcoded, pending real discovery) */
-int32 OffsetFinder::FindFieldPathPropertyFieldClassOffset(int32 PropertySize) {
-	return PropertySize;
+/* FieldPathProperty: PropertyClass, the FFieldClass a TFieldPath may point to - FField or one of its
+   subclasses, so following SuperClass from it ends at the root of IntProperty's field-class chain. */
+int32 OffsetFinder::FindFieldPathPropertyFieldClassOffset(int32 PropertySize)
+{
+	if (PropertySize == OffsetNotFound || Off::FFieldClass::SuperClass == OffsetNotFound)
+		return OffsetNotFound;
+
+	const uint8* const IntClass = IntAndByteFieldClasses().first;
+	if (!IntClass)
+		return OffsetNotFound;
+
+	auto RootOf =[](const uint8* FieldClass) -> const uint8*
+	{
+		for (int i = 0; FieldClass && i < 0x10; i++)
+		{
+			if (Platform::IsBadReadPtr(FieldClass + Off::FFieldClass::SuperClass))
+				return nullptr;
+
+			const uint8* const Super = *reinterpret_cast<const uint8* const*>(FieldClass + Off::FFieldClass::SuperClass);
+
+			if (!Super)
+				return FieldClass;
+
+			FieldClass = Super;
+		}
+
+		return nullptr;
+	};
+
+	const uint8* const FieldRoot = RootOf(IntClass);
+	const std::vector<UEProperty> Samples = SampleProperties(EClassCastFlags::FieldPathProperty, 8);
+
+	const bool bAllPointIntoFieldClasses = !Samples.empty() && FieldRoot && std::all_of(Samples.begin(), Samples.end(), [&](const UEProperty& Prop)
+	{
+		const uint8* const FieldClass = static_cast<const uint8*>(ReadPtr(Prop, PropertySize));
+		return FieldClass && RootOf(FieldClass) == FieldRoot;
+	});
+
+	return bAllPointIntoFieldClasses ? PropertySize : OffsetNotFound;
 }
 
-/* OptionalProperty (hardcoded, pending real discovery) */
+/* OptionalProperty (UE5): ValueProperty, the property it wraps and owns. */
 int32 OffsetFinder::FindOptionalPropertyValuePropertyOffset(int32 PropertySize)
 {
-	return PropertySize;
+	return FindOwnedPropertySlot(EClassCastFlags::OptionalProperty, PropertySize, 1);
+}
+
+/* ClassProperty: MetaClass follows ObjectProperty::PropertyClass. GameModeBase's class members name
+   the classes they are constrained to. */
+int32_t OffsetFinder::FindClassPropertyMetaClassOffset(int32 PropertyClassOffset)
+{
+	if (PropertyClassOffset == OffsetNotFound)
+		return OffsetNotFound;
+
+	const UEClass GameModeBase = ObjectArray::FindClassFast("GameModeBase");
+	if (!GameModeBase)
+		return OffsetNotFound;
+
+	std::vector<std::pair<void*, void*>> Infos;
+
+	for (const auto& [MemberName, MetaClassName] : { std::pair{ "PlayerControllerClass", "PlayerController" }, std::pair{ "DefaultPawnClass", "Pawn" }, std::pair{ "HUDClass", "HUD" } })
+	{
+		void* const Member = GameModeBase.FindMember(MemberName, EClassCastFlags::ClassProperty).GetAddress();
+		void* const MetaClass = ObjectArray::FindClassFast(MetaClassName).GetAddress();
+
+		if (Member && MetaClass)
+			Infos.push_back({ Member, MetaClass });
+	}
+
+	if (Infos.size() < 2)
+		return OffsetNotFound;
+
+	return FindOffset<sizeof(void*)>(Infos, PropertyClassOffset + sizeof(void*), PropertyClassOffset + 0x20);
+}
+
+/* InterfaceProperty: InterfaceClass, the first member it adds, a class in every sample. */
+int32_t OffsetFinder::FindInterfacePropertyInterfaceClassOffset(int32 PropertySize)
+{
+	return HoldObjectsOfType(SampleProperties(EClassCastFlags::InterfaceProperty, 8), PropertySize, EClassCastFlags::Class) ? PropertySize : OffsetNotFound;
+}
+
+/* MulticastDelegateProperty (inline and sparse): SignatureFunction, the first member it adds. */
+int32_t OffsetFinder::FindMulticastDelegatePropertySignatureFunctionOffset(int32 PropertySize)
+{
+	return HoldObjectsOfType(SampleProperties(EClassCastFlags::MulticastDelegateProperty, 8), PropertySize, EClassCastFlags::Function) ? PropertySize : OffsetNotFound;
+}
+
+/* FField::FlagsPrivate follows the name. Reflected native properties are all created with the same
+   object flags (RF_Public | RF_Transient | RF_MarkAsNative), so FGuid's members agree there, and
+   RF_Public is set. */
+int32_t OffsetFinder::FindFFieldFlagsOffset()
+{
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+	if (!Guid || Off::FField::Name == OffsetNotFound)
+		return OffsetNotFound;
+
+	const int32 Candidate = Off::FField::Name + Off::InSDK::Name::FNameSize;
+	const std::vector<UEProperty> Members = Guid.GetProperties();
+
+	if (Members.empty())
+		return OffsetNotFound;
+
+	auto FlagsOf = [Candidate](const UEProperty& Prop) { return *reinterpret_cast<const uint32*>(static_cast<const uint8*>(Prop.GetAddress()) + Candidate); };
+
+	const uint32 First = FlagsOf(Members[0]);
+	const bool bAllEqual = std::all_of(Members.begin(), Members.end(), [&](const UEProperty& Prop) { return FlagsOf(Prop) == First; });
+
+	return bAllEqual && (First & static_cast<uint32>(EObjectFlags::Public)) ? Candidate : OffsetNotFound;
+}
+
+/* FUObjectItem::Flags (EInternalObjectFlags), which the GC keep sets RootSet in. Native classes are
+   registered with RF_MarkAsNative | RF_MarkAsRootSet, which UObjectBase::AddObject turns into the
+   Native and RootSet internal flags, so the items of a few native classes carry both there. */
+int32 OffsetFinder::FindFUObjectItemFlagsOffset()
+{
+	constexpr uint32 Native = 1u << 25;
+	constexpr uint32 RootSet = 1u << 30;
+
+	int32 NumChecked = 0;
+
+	for (const char* ClassName : { "Object", "Class", "Actor" })
+	{
+		const UEClass Class = ObjectArray::FindClassFast(ClassName);
+		const uint8* const Item = Class ? static_cast<const uint8*>(ObjectArray::GetItemAddress(Class.GetIndex())) : nullptr;
+
+		if (!Item)
+			continue;
+
+		const uint32 Flags = *reinterpret_cast<const uint32*>(Item + sizeof(void*));
+
+		if ((Flags & (Native | RootSet)) != (Native | RootSet))
+			return OffsetNotFound;
+
+		NumChecked++;
+	}
+
+	return NumChecked > 0 ? static_cast<int32>(sizeof(void*)) : OffsetNotFound;
 }

@@ -616,16 +616,28 @@ bool NameArray::SetGNamesWithoutCommitting()
 	if (Off::InSDK::NameArray::GNames != 0x0)
 		return false;
 
+	const uintptr_t ImageBase = Platform::GetModuleBase();
+
 	if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindNameArray))
 	{
 		std::cerr << std::format("Found 'TNameEntryArray GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
 		Settings::Internal::bUseNamePool = false;
+
+		uint8* const Address = *reinterpret_cast<uint8**>(ImageBase + Off::InSDK::NameArray::GNames);
+		if (InitializeNameArray(Address))
+			GNames = Address;
+
 		return true;
 	}
 	else if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindNamePool))
 	{
 		std::cerr << std::format("Found 'FNamePool GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
 		Settings::Internal::bUseNamePool = true;
+
+		uint8* const Address = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
+		if (InitializeNamePool(Address))
+			GNames = Address;
+
 		return true;
 	}
 
@@ -633,8 +645,46 @@ bool NameArray::SetGNamesWithoutCommitting()
 	return false;
 }
 
+bool NameArray::IsValidCompIdx(int32 CompIdx)
+{
+	if (!GNames || !bBoundsKnown)
+		return true;
+
+	if (CompIdx < 0)
+		return false;
+
+	if (!Settings::Internal::bUseNamePool)
+		return CompIdx < GetNumElements();
+
+	const int32 Block = CompIdx >> FNameBlockOffsetBits;
+	const int64 ByteOffset = static_cast<int64>(CompIdx & ((1 << FNameBlockOffsetBits) - 1)) * NameEntryStride;
+
+	return Block < GetNumChunks() || (Block == GetNumChunks() && ByteOffset < GetByteCursor());
+}
+
 void NameArray::PostInit()
 {
+	/* The bounds go live only if every object's name passes them, so a misread table never rejects a
+	   real name. Only indices are compared here. */
+	auto CheckBounds = []()
+	{
+		bBoundsKnown = true;
+
+		for (UEObject Obj : ObjectArray())
+		{
+			if (!IsValidCompIdx(Obj.GetFName().GetCompIdx()))
+			{
+				bBoundsKnown = false;
+				break;
+			}
+		}
+
+		std::cerr << (bBoundsKnown ? "Name table bounds: checked against every object name\n" : "Name table bounds: an object name falls outside them - not used\n");
+	};
+
+	if (GNames && !Settings::Internal::bUseNamePool)
+		CheckBounds();
+
 	if (GNames && Settings::Internal::bUseNamePool)
 	{
 		// Reverse-order iteration because newer objects are more likely to have a chunk-index equal to NumChunks - 1
@@ -670,6 +720,8 @@ void NameArray::PostInit()
 		Off::InSDK::NameArray::FNamePoolBlockOffsetBits = NameArray::FNameBlockOffsetBits;
 
 		std::cerr << "NameArray::FNameBlockOffsetBits: 0x" << std::hex << NameArray::FNameBlockOffsetBits << "\n" << std::endl;
+
+		CheckBounds();
 	}
 }
 

@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <format>
+#include <fstream>
 #include <unordered_map>
 
 #include "Utils.h"
@@ -11,6 +13,128 @@
 
 #include "Platform.h"
 #include "Architecture.h"
+
+
+namespace
+{
+	struct FOffsetEntry
+	{
+		std::string Name;
+		int32 Value;
+		EOffsetSource Source;
+		std::string Note;
+	};
+
+	/* In init order, which is deterministic, so two dumps' tables line up entry for entry. */
+	std::vector<FOffsetEntry> OffsetTable;
+
+	const char* SourceName(EOffsetSource Source)
+	{
+		switch (Source)
+		{
+		case EOffsetSource::Scan:     return "scan";
+		case EOffsetSource::Override: return "override";
+		case EOffsetSource::Default:  return "default";
+		default:                      return "missing";
+		}
+	}
+
+	std::string FormatEntry(const FOffsetEntry& Entry)
+	{
+		const std::string Value = Entry.Source == EOffsetSource::Missing ? "-" : std::format("0x{:X}", Entry.Value);
+		return std::format("{:<52}{:>12}  {:<8}{}{}", Entry.Name, Value, SourceName(Entry.Source), Entry.Note.empty() ? "" : "  ", Entry.Note);
+	}
+}
+
+int32 Off::Log(const std::string& Name, int32 Value, EOffsetSource Source, const std::string& Note)
+{
+	FOffsetEntry Entry{ Name, Value, Source, Note };
+
+	/* A name logged twice (a finder that runs again, or a manual override after a scan) keeps its slot
+	   in the table and takes the newer value. */
+	auto It = std::find_if(OffsetTable.begin(), OffsetTable.end(), [&](const FOffsetEntry& E) { return E.Name == Name; });
+
+	if (It != OffsetTable.end())
+		*It = Entry;
+	else
+		OffsetTable.push_back(Entry);
+
+	std::cerr << "[offset] " << FormatEntry(Entry) << "\n";
+	return Value;
+}
+
+int32 Off::Found(const std::string& Name, int32 Value)
+{
+	return Log(Name, Value, Value == OffsetFinder::OffsetNotFound ? EOffsetSource::Missing : EOffsetSource::Scan);
+}
+
+int32 Off::FoundOr(const std::string& Name, int32 Value, int32 Default, bool bDefaultHolds, const std::string& HoldsFor)
+{
+	if (Value != OffsetFinder::OffsetNotFound)
+		return Log(Name, Value, EOffsetSource::Scan);
+
+	if (bDefaultHolds)
+		return Log(Name, Default, EOffsetSource::Default, HoldsFor);
+
+	return Log(Name, OffsetFinder::OffsetNotFound, EOffsetSource::Missing, "no default for this engine (" + HoldsFor + ")");
+}
+
+int32 Off::FoundRva(const std::string& Name, int32 Rva)
+{
+	return Log(Name, Rva, Rva != 0x0 ? EOffsetSource::Scan : EOffsetSource::Missing);
+}
+
+std::vector<std::string> Off::MissingEssentials()
+{
+	/* What every generator reads for every object and property; nothing can be dumped without them. */
+	static constexpr const char* Essentials[] =
+	{
+		"UObject::Flags", "UObject::Index", "UObject::Class", "UObject::Name", "UObject::Outer",
+		"UField::Next", "UStruct::SuperStruct", "UStruct::Children", "UStruct::Size", "UStruct::MinAlignment",
+		"UStruct::ChildProperties", "UClass::CastFlags", "UClass::ClassDefaultObject", "UFunction::FunctionFlags", "UEnum::Names",
+		"FField::Class", "FField::Owner", "FField::Next", "FField::Name", "FFieldClass::CastFlags",
+		"Property::ArrayDim", "Property::ElementSize", "Property::PropertyFlags", "Property::Offset_Internal",
+		"Property::Size", "BoolProperty::Base",
+	};
+
+	std::vector<std::string> Missing;
+	for (const FOffsetEntry& Entry : OffsetTable)
+	{
+		if (Entry.Source == EOffsetSource::Missing && std::find(std::begin(Essentials), std::end(Essentials), Entry.Name) != std::end(Essentials))
+			Missing.push_back(Entry.Name);
+	}
+
+	return Missing;
+}
+
+void Off::PrintSummary()
+{
+	int32 Counts[4] = {};
+	for (const FOffsetEntry& Entry : OffsetTable)
+		Counts[static_cast<int32>(Entry.Source)]++;
+
+	std::cerr << std::format("\nOffset table: {} entries - {} scan, {} override, {} default, {} missing (full table: Offsets.txt beside the dump)\n",
+		OffsetTable.size(), Counts[0], Counts[1], Counts[2], Counts[3]);
+
+	for (const FOffsetEntry& Entry : OffsetTable)
+	{
+		if (Entry.Source != EOffsetSource::Scan)
+			std::cerr << "  " << FormatEntry(Entry) << "\n";
+	}
+
+	std::cerr << std::endl;
+}
+
+void Off::WriteTable(const std::filesystem::path& File)
+{
+	std::ofstream Out(File);
+
+	Out << "Dumper-7 offset table - " << Settings::Generator::GameVersion << " " << Settings::Generator::GameName << "\n";
+	Out << "scan = verified against this build, override = set by hand, default = known value for the versions noted, missing = never read\n\n";
+
+	for (const FOffsetEntry& Entry : OffsetTable)
+		Out << FormatEntry(Entry) << "\n";
+}
 
 
 void Off::InSDK::ProcessEvent::InitPE_Windows()
@@ -168,7 +292,7 @@ static uintptr_t GetKismetExecAddress(const char* const FunctionName)
 	if (!Fn)
 		return 0x0;
 
-	if (Off::UFunction::ExecFunction == 0x0)
+	if (Off::UFunction::ExecFunction == OffsetFinder::OffsetNotFound)
 		return 0x0;
 
 	void* const ExecPtr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(const_cast<void*>(Fn.GetAddress())) + Off::UFunction::ExecFunction);
@@ -923,6 +1047,12 @@ void Off::InSDK::Text::InitTextOffsets()
 		}
 	}
 
+	if (!InStringProp || !ReturnProp)
+	{
+		std::cerr << "Conv_StringToText doesn't have the expected parameters!\n";
+		return;
+	}
+
 	const int32 ParamSize = Conv_StringToText.GetStructSize();
 	const int32 FTextSize = ReturnProp.GetSize();
 
@@ -963,14 +1093,20 @@ void Off::InSDK::Text::InitTextOffsets()
 		}
 	}
 
+	Off::Log("FText::Size", FTextSize, EOffsetSource::Scan);
+
 	if (!FTextDataPtr)
 	{
-		std::cerr << std::format("\nDumper-7: Error, 'FTextDataPtr' could not be found!\n") << std::endl;
+		Off::Log("FText::TextData", OffsetFinder::OffsetNotFound, EOffsetSource::Missing, "the SDK's FText keeps it at 0");
 		return;
 	}
 
+	Off::Log("FText::TextData", Off::InSDK::Text::TextDatOffset, EOffsetSource::Scan);
+
 	constexpr int32 MaxOffset = 0x50;
 	constexpr int32 StartOffset = sizeof(void*); // FString::NumElements offset
+
+	bool bFoundString = false;
 
 	/* Search for a pointer pointing to a int32 Value (FString::NumElements) equal to StringLength */
 	for (int32 i = StartOffset; i < MaxOffset; i += sizeof(int32))
@@ -981,13 +1117,15 @@ void Off::InSDK::Text::InitTextOffsets()
 		if (PossibleLength == StringLength && PosibleStringPtr && IsValidPtr(PosibleStringPtr) && memcmp(StringText, PosibleStringPtr, StringLengthBytes) == 0)
 		{
 			Off::InSDK::Text::InTextDataStringOffset = (i - sizeof(void*));
+			bFoundString = true;
 			break;
 		}
 	}
 
-	std::cerr << std::format("Off::InSDK::Text::TextSize: 0x{:X}\n", Off::InSDK::Text::TextSize);
-	std::cerr << std::format("Off::InSDK::Text::TextDatOffset: 0x{:X}\n", Off::InSDK::Text::TextDatOffset);
-	std::cerr << std::format("Off::InSDK::Text::InTextDataStringOffset: 0x{:X}\n\n", Off::InSDK::Text::InTextDataStringOffset);
+	if (bFoundString)
+		Off::Log("FTextData::TextSource", Off::InSDK::Text::InTextDataStringOffset, EOffsetSource::Scan);
+	else
+		Off::Log("FTextData::TextSource", OffsetFinder::OffsetNotFound, EOffsetSource::Missing, "the SDK's FText::ToString keeps it at 0");
 }
 
 void Off::Init()

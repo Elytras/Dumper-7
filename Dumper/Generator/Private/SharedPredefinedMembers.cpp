@@ -11,28 +11,34 @@ void InitCorePredefinedMembers(PredefinedMemberLookupMapType& OutMembers)
 		if (Level == nullptr)
 			Level = ObjectArray::FindClassFast("level");
 
-		PredefinedElements& ULevelPredefs = OutMembers[Level.GetIndex()];
-		ULevelPredefs.Members =
+		if (Level)
+		{
+			PredefinedElements& ULevelPredefs = OutMembers[Level.GetIndex()];
+			ULevelPredefs.Members =
+			{
+				PredefinedMember {
+					.Comment = "THIS IS THE ARRAY YOU'RE LOOKING FOR! [NOT AUTO-GENERATED PROPERTY]",
+					.Type = "class TArray<class AActor*>", .Name = "Actors", .Offset = Off::InSDK::ULevel::Actors, .Size = sizeof(TArray<int>), .ArrayDim = 0x1, .Alignment = alignof(TArray<int>),
+					.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
+				},
+			};
+		}
+	}
+
+	const UEClass DataTable = ObjectArray::FindClassFast("DataTable");
+
+	if (DataTable && Off::InSDK::UDataTable::RowMap != -1)
+	{
+		PredefinedElements& UDataTablePredefs = OutMembers[DataTable.GetIndex()];
+		UDataTablePredefs.Members =
 		{
 			PredefinedMember {
-				.Comment = "THIS IS THE ARRAY YOU'RE LOOKING FOR! [NOT AUTO-GENERATED PROPERTY]",
-				.Type = "class TArray<class AActor*>", .Name = "Actors", .Offset = Off::InSDK::ULevel::Actors, .Size = sizeof(TArray<int>), .ArrayDim = 0x1, .Alignment = alignof(TArray<int>),
+				.Comment = "So, here's a RowMap. Good luck with it.",
+				.Type = "TMap<class FName, uint8*>", .Name = "RowMap", .Offset = Off::InSDK::UDataTable::RowMap, .Size = sizeof(TMap<int, int>), .ArrayDim = 0x1, .Alignment = alignof(TMap<int, int>),
 				.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
 			},
 		};
 	}
-
-	UEClass DataTable = ObjectArray::FindClassFast("DataTable");
-
-	PredefinedElements& UDataTablePredefs = OutMembers[DataTable.GetIndex()];
-	UDataTablePredefs.Members =
-	{
-		PredefinedMember {
-			.Comment = "So, here's a RowMap. Good luck with it.",
-			.Type = "TMap<class FName, uint8*>", .Name = "RowMap", .Offset = Off::InSDK::UDataTable::RowMap, .Size = sizeof(TMap<int, int>), .ArrayDim = 0x1, .Alignment = alignof(TMap<int, int>),
-			.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
-		},
-	};
 
 	PredefinedElements& UObjectPredefs = OutMembers[ObjectArray::FindClassFast("Object").GetIndex()];
 	UObjectPredefs.Members =

@@ -35,13 +35,15 @@ namespace
 		case EOffsetSource::Scan:     return "scan";
 		case EOffsetSource::Override: return "override";
 		case EOffsetSource::Default:  return "default";
+		case EOffsetSource::Unused:   return "unused";
 		default:                      return "missing";
 		}
 	}
 
 	std::string FormatEntry(const FOffsetEntry& Entry)
 	{
-		const std::string Value = Entry.Source == EOffsetSource::Missing ? "-" : std::format("0x{:X}", Entry.Value);
+		const bool bNoValue = Entry.Source == EOffsetSource::Missing || Entry.Source == EOffsetSource::Unused;
+		const std::string Value = bNoValue ? "-" : std::format("0x{:X}", Entry.Value);
 		return std::format("{:<52}{:>12}  {:<8}{}{}", Entry.Name, Value, SourceName(Entry.Source), Entry.Note.empty() ? "" : "  ", Entry.Note);
 	}
 }
@@ -94,7 +96,10 @@ std::vector<std::string> Off::MissingEssentials()
 		"UStruct::ChildProperties", "UClass::CastFlags", "UClass::ClassDefaultObject", "UFunction::FunctionFlags", "UEnum::Names",
 		"FField::Class", "FField::Owner", "FField::Next", "FField::Name", "FFieldClass::CastFlags",
 		"Property::ArrayDim", "Property::ElementSize", "Property::PropertyFlags", "Property::Offset_Internal",
-		"Property::Size", "BoolProperty::Base",
+		"Property::Size", "BoolProperty::Base", "FFieldClass::Name",
+		/* Every generator follows these without a null check; a kind the game never uses is logged Unused instead. */
+		"ObjectProperty::PropertyClass", "StructProperty::Struct", "ArrayProperty::Inner", "SetProperty::ElementProp",
+		"MapProperty::Base", "EnumProperty::Base", "OptionalProperty::ValueProperty",
 	};
 
 	std::vector<std::string> Missing;
@@ -109,12 +114,12 @@ std::vector<std::string> Off::MissingEssentials()
 
 void Off::PrintSummary()
 {
-	int32 Counts[4] = {};
+	int32 Counts[5] = {};
 	for (const FOffsetEntry& Entry : OffsetTable)
 		Counts[static_cast<int32>(Entry.Source)]++;
 
-	std::cerr << std::format("\nOffset table: {} entries - {} scan, {} override, {} default, {} missing (full table: Offsets.txt beside the dump)\n",
-		OffsetTable.size(), Counts[0], Counts[1], Counts[2], Counts[3]);
+	std::cerr << std::format("\nOffset table: {} entries - {} scan, {} override, {} default, {} missing, {} unused (full table: Offsets.txt beside the dump)\n",
+		OffsetTable.size(), Counts[0], Counts[1], Counts[2], Counts[3], Counts[4]);
 
 	for (const FOffsetEntry& Entry : OffsetTable)
 	{
@@ -130,7 +135,7 @@ void Off::WriteTable(const std::filesystem::path& File)
 	std::ofstream Out(File);
 
 	Out << "Dumper-7 offset table - " << Settings::Generator::GameVersion << " " << Settings::Generator::GameName << "\n";
-	Out << "scan = verified against this build, override = set by hand, default = known value for the versions noted, missing = never read\n\n";
+	Out << "scan = verified against this build, override = set by hand, default = known value for the versions noted, missing = never read, unused = nothing in this game has it\n\n";
 
 	for (const FOffsetEntry& Entry : OffsetTable)
 		Out << FormatEntry(Entry) << "\n";
@@ -1128,356 +1133,242 @@ void Off::InSDK::Text::InitTextOffsets()
 		Off::Log("FTextData::TextSource", OffsetFinder::OffsetNotFound, EOffsetSource::Missing, "the SDK's FText::ToString keeps it at 0");
 }
 
-void Off::Init()
+bool Off::Init()
 {
-	auto OverwriteIfInvalidOffset = [](int32& Offset, int32 DefaultValue)
-		{
-			if (Offset == OffsetFinder::OffsetNotFound)
-			{
-				std::cerr << std::format("Defaulting to offset: 0x{:X}\n", DefaultValue);
-				Offset = DefaultValue;
-			}
-		};
+	using OffsetFinder::OffsetNotFound;
 
-	Off::UObject::Flags = OffsetFinder::FindUObjectFlagsOffset();
-	OverwriteIfInvalidOffset(Off::UObject::Flags, sizeof(void*)); // Default to right after VTable
-	std::cerr << std::format("Off::UObject::Flags: 0x{:X}\n", Off::UObject::Flags);
+	/* An essential offset that came out missing ends the scan right there: the finders after it read
+	   through it. Generator::InitEngineCore() then refuses to dump. */
+	auto AllFound = [](std::initializer_list<int32> Offsets)
+	{
+		return std::none_of(Offsets.begin(), Offsets.end(), [](int32 Offset) { return Offset == OffsetNotFound; });
+	};
 
-	Off::UObject::Index = OffsetFinder::FindUObjectIndexOffset();
-	OverwriteIfInvalidOffset(Off::UObject::Index, (Off::UObject::Flags + sizeof(int32))); // Default to right after Flags
-	std::cerr << std::format("Off::UObject::Index: 0x{:X}\n", Off::UObject::Index);
+	/* A member only one kind of property has. Where the game has no property of that kind, nothing will
+	   ever read it, so a failed finder there is no loss and is logged as such. */
+	auto KindMember = [](const char* Name, int32 Value, EClassCastFlags Kind) -> int32
+	{
+		if (Value == OffsetNotFound && OffsetFinder::SampleProperties(Kind, 1).empty())
+			return Log(Name, OffsetNotFound, EOffsetSource::Unused, "no property of this kind in the game");
 
-	Off::UObject::Class = OffsetFinder::FindUObjectClassOffset();
-	OverwriteIfInvalidOffset(Off::UObject::Class, (Off::UObject::Index + sizeof(int32))); // Default to right after Index
-	std::cerr << std::format("Off::UObject::Class: 0x{:X}\n", Off::UObject::Class);
+		return Found(Name, Value);
+	};
 
-	Off::UObject::Outer = OffsetFinder::FindUObjectOuterOffset();
-	std::cerr << std::format("Off::UObject::Outer: 0x{:X}\n", Off::UObject::Outer);
+	/* Found before this by ObjectArray::Init() and FName::Init(); listed so the table holds them too. */
+	FoundRva("GObjects", Off::InSDK::ObjArray::GObjects);
+	Log("FUObjectArray::Objects", Off::FUObjectArray::GetObjectsOffset(), EOffsetSource::Scan);
+	Log("FUObjectArray::NumElements", Off::FUObjectArray::GetNumElementsOffset(), EOffsetSource::Scan);
+	Log("FUObjectItem::Object", Off::InSDK::ObjArray::FUObjectItemInitialOffset, EOffsetSource::Scan);
+	Log("FUObjectItem::Size", Off::InSDK::ObjArray::FUObjectItemSize, EOffsetSource::Scan);
+	FoundRva("FName::AppendString", Off::InSDK::Name::AppendNameToString);
+	FoundRva("GNames", Off::InSDK::NameArray::GNames);
 
-	Off::UObject::Name = OffsetFinder::FindUObjectNameOffset();
-	OverwriteIfInvalidOffset(Off::UObject::Name, (Off::UObject::Class + sizeof(void*))); // Default to right after Class
-	std::cerr << std::format("Off::UObject::Name: 0x{:X}\n\n", Off::UObject::Name);
+	/* UObject. Class, Name and Outer are followed, so they are found or the dump stops. Flags is only ever
+	   compared: where Index sits in the stock UObjectBase { vtable, Flags, Index, ... }, the stock place
+	   stands in for a failed scan. */
+	Off::UObject::Vft = Log("UObject::Vft", 0x0, EOffsetSource::Default, "the vtable pointer leads every polymorphic class");
+	Off::UObject::Index = Found("UObject::Index", OffsetFinder::FindUObjectIndexOffset());
+	Off::UObject::Flags = FoundOr("UObject::Flags", OffsetFinder::FindUObjectFlagsOffset(), sizeof(void*),
+		Off::UObject::Index == sizeof(void*) + sizeof(int32), "stock UObjectBase, confirmed by Index");
+	Off::UObject::Class = Found("UObject::Class", OffsetFinder::FindUObjectClassOffset());
 
-	OverwriteIfInvalidOffset(Off::UObject::Outer, (Off::UObject::Name + sizeof(int32) + sizeof(int32)));  // Default to right after Name
+	/* Outer first: Name's finder steers clear of it. */
+	Off::UObject::Outer = Found("UObject::Outer", OffsetFinder::FindUObjectOuterOffset());
+	Off::UObject::Name = Found("UObject::Name", OffsetFinder::FindUObjectNameOffset());
+
+	if (!AllFound({ Off::UObject::Index, Off::UObject::Flags, Off::UObject::Class, Off::UObject::Name, Off::UObject::Outer }))
+		return false;
 
 	OffsetFinder::InitFNameSettings();
 
 	::NameArray::PostInit();
 
 	// Castflags needs to stay here since the FindChildOffset() uses CastFlags
-	Off::UClass::CastFlags = OffsetFinder::FindCastFlagsOffset();
-	std::cerr << std::format("Off::UClass::CastFlags: 0x{:X}\n", Off::UClass::CastFlags);
+	Off::UClass::CastFlags = Found("UClass::CastFlags", OffsetFinder::FindCastFlagsOffset());
 
-	Off::UStruct::Children = OffsetFinder::FindChildOffset();
-	std::cerr << std::format("Off::UStruct::Children: 0x{:X}\n", Off::UStruct::Children);
+	if (!AllFound({ Off::UClass::CastFlags }))
+		return false;
 
-	Off::UField::Next = OffsetFinder::FindUFieldNextOffset();
-	std::cerr << std::format("Off::UField::Next: 0x{:X}\n", Off::UField::Next);
+	Off::UStruct::Children = Found("UStruct::Children", OffsetFinder::FindChildOffset());
+	Off::UField::Next = Found("UField::Next", OffsetFinder::FindUFieldNextOffset());
+	Off::UStruct::SuperStruct = Found("UStruct::SuperStruct", OffsetFinder::FindSuperOffset());
+	Off::UStruct::Size = Found("UStruct::Size", OffsetFinder::FindStructSizeOffset());
+	Off::UStruct::MinAlignment = Found("UStruct::MinAlignment", OffsetFinder::FindMinAlignmentOffset());
 
-	Off::UStruct::SuperStruct = OffsetFinder::FindSuperOffset();
-	std::cerr << std::format("Off::UStruct::SuperStruct: 0x{:X}\n", Off::UStruct::SuperStruct);
+	if (!AllFound({ Off::UStruct::Children, Off::UField::Next, Off::UStruct::SuperStruct, Off::UStruct::Size, Off::UStruct::MinAlignment }))
+		return false;
 
-	Off::UStruct::Size = OffsetFinder::FindStructSizeOffset();
-	std::cerr << std::format("Off::UStruct::Size: 0x{:X}\n", Off::UStruct::Size);
+	/* FStructBaseChain, UE4.22+: StructBaseChainArray with NumStructBasesInChainMinusOne behind it. */
+	Off::UStruct::StructBaseChainArray = Found("UStruct::StructBaseChainArray", OffsetFinder::FindStructBaseChainOffset());
 
-	Off::UStruct::MinAlignment = OffsetFinder::FindMinAlignmentOffset();
-	std::cerr << std::format("Off::UStruct::MinAlignment: 0x{:X}\n", Off::UStruct::MinAlignment);
-
-	Off::UClass::CastFlags = OffsetFinder::FindCastFlagsOffset();
-	std::cerr << std::format("Off::UClass::CastFlags: 0x{:X}\n", Off::UClass::CastFlags);
-
-	// Castflags become available for use
-
-	// UStruct::Script (BP bytecode) + StructBaseChain (O(1) IsChildOf) - derived from binary, not emitted by older Dumper-7.
-	// Script needs MinAlignment (+ CastFlags for the IsA(Function) verify); StructBaseChain needs SuperStruct - all set above.
-	Off::UStruct::Script = OffsetFinder::FindScriptOffset();
-	std::cerr << std::format("Off::UStruct::Script: 0x{:X}\n", Off::UStruct::Script);
-
-	Off::UStruct::StructBaseChainArray = OffsetFinder::FindStructBaseChainOffset();
-	if (Off::UStruct::StructBaseChainArray != OffsetFinder::OffsetNotFound)
+	if (Off::UStruct::StructBaseChainArray != OffsetNotFound)
 	{
 		Off::UStruct::NumStructBasesInChainMinusOne = Off::UStruct::StructBaseChainArray + sizeof(void*);
-		/* Same offset, upstream's name for it (consumed by SharedPredefinedMembers/IDAMappingGenerator). One
-		   finder feeds both - upstream's separate FindStructBaseChainOffset duplicate was dropped in the merge. */
 		Off::UStruct::StructBaseChain = Off::UStruct::StructBaseChainArray;
 	}
-	std::cerr << std::format("Off::UStruct::StructBaseChainArray: 0x{:X} (NumStructBasesInChainMinusOne @ 0x{:X})\n",
-		Off::UStruct::StructBaseChainArray, Off::UStruct::NumStructBasesInChainMinusOne);
 
 	if (Settings::Internal::bUseFProperty)
 	{
-		std::cerr << std::format("\nGame uses FProperty system\n\n");
+		std::cerr << "\nGame uses FProperty system\n\n";
 
-		Off::UStruct::ChildProperties = OffsetFinder::FindChildPropertiesOffset();
-		std::cerr << std::format("Off::UStruct::ChildProperties: 0x{:X}\n", Off::UStruct::ChildProperties);
+		Off::UStruct::ChildProperties = Found("UStruct::ChildProperties", OffsetFinder::FindChildPropertiesOffset());
 
-		OffsetFinder::FixupHardcodedOffsets(); // must be called after FindChildPropertiesOffset 
+		if (!AllFound({ Off::UStruct::ChildProperties }))
+			return false;
 
-		Off::FField::Next = OffsetFinder::FindFFieldNextOffset();
-		std::cerr << std::format("Off::FField::Next: 0x{:X}\n", Off::FField::Next);
+		Off::FField::Vft = Log("FField::Vft", 0x0, EOffsetSource::Default, "the vtable pointer leads every polymorphic class");
+		Off::FField::Class = Found("FField::Class", OffsetFinder::FindFFieldClassOffset());
 
-		Off::FField::Class = OffsetFinder::FindFFieldClassOffset();
-		std::cerr << std::format("Off::FField::Class: 0x{:X}\n", Off::FField::Class);
+		if (!AllFound({ Off::FField::Class }))
+			return false;
 
-		// Comment out this line if you're crashing here and see if the NewFindFFieldNameOffset might work!
-		Off::FField::Name = OffsetFinder::FindFFieldNameOffset();
-		//Off::FField::Name = OffsetFinder::NewFindFFieldNameOffset();
+		Off::FField::Owner = Found("FField::Owner", OffsetFinder::FindFFieldOwnerOffset());
 
-		if (Off::FField::Name == OffsetFinder::OffsetNotFound)
-			Off::FField::Name = OffsetFinder::NewFindFFieldNameOffset();
+		/* Whether FFieldVariant is a pointer and a bool or one tagged pointer; FField::Next is found behind it. */
+		OffsetFinder::FixupHardcodedOffsets();
 
-		std::cerr << std::format("Off::FField::Name: 0x{:X}\n", Off::FField::Name);
+		Off::FField::Next = Found("FField::Next", OffsetFinder::FindFFieldNextOffset());
+		Off::FFieldClass::CastFlags = Found("FFieldClass::CastFlags", OffsetFinder::FindFieldClassCastFlagsOffset());
 
-		/*
-		* FNameSize might be wrong at this point of execution.
-		* FField::Flags is not critical so a fix is only applied later in OffsetFinder::PostInitFNameSettings().
-		*/
-		Off::FField::Flags = Off::FField::Name + Off::InSDK::Name::FNameSize;
-		std::cerr << std::format("Off::FField::Flags: 0x{:X}\n", Off::FField::Flags);
+		if (!AllFound({ Off::FField::Owner, Off::FField::Next, Off::FFieldClass::CastFlags }))
+			return false;
+
+		/* By name: the name-table bounds checked in NameArray::PostInit() turn a slot that isn't a name
+		   into a mismatch instead of a lookup. */
+		int32 FieldName = OffsetFinder::FindFFieldNameOffset();
+
+		if (FieldName == OffsetNotFound)
+			FieldName = OffsetFinder::NewFindFFieldNameOffset();
+
+		Off::FField::Name = Found("FField::Name", FieldName);
+
+		if (!AllFound({ Off::FField::Name }))
+			return false;
+
+		Off::FFieldClass::Id = Found("FFieldClass::Id", OffsetFinder::FindFieldClassIdOffset());
+		Off::FFieldClass::SuperClass = Found("FFieldClass::SuperClass", OffsetFinder::FindFieldClassSuperClassOffset());
+
+		/* ClassFlags (a uint32) is all that fits between CastFlags and SuperClass. */
+		const bool bClassFlagsFit = Off::FFieldClass::SuperClass != OffsetNotFound && Off::FFieldClass::SuperClass - Off::FFieldClass::CastFlags == 0x10;
+		Off::FFieldClass::ClassFlags = bClassFlagsFit
+			? Log("FFieldClass::ClassFlags", Off::FFieldClass::CastFlags + sizeof(uint64), EOffsetSource::Scan, "between CastFlags and SuperClass")
+			: Log("FFieldClass::ClassFlags", OffsetNotFound, EOffsetSource::Missing);
+
+		/* The name leads FFieldClass: FGuid's first member must come out as an IntProperty. */
+		Off::FFieldClass::Name = 0x0;
+		const bool bFieldClassNamed = ObjectArray::FindStructFast("Guid").GetChildProperties().GetClass().GetName() == "IntProperty";
+		Off::FFieldClass::Name = Found("FFieldClass::Name", bFieldClassNamed ? 0x0 : OffsetNotFound);
+	}
+
+	Off::UClass::ClassDefaultObject = Found("UClass::ClassDefaultObject", OffsetFinder::FindDefaultObjectOffset());
+	Off::UClass::ImplementedInterfaces = Found("UClass::ImplementedInterfaces", OffsetFinder::FindImplementedInterfacesOffset());
+
+	Off::UEnum::Names = Found("UEnum::Names", OffsetFinder::FindEnumNamesOffset());
+	Off::UEnum::UnderlyingType = OffsetFinder::FindEnumUnderlayingTypeOffset();
+	Log("UEnum::UnderlyingType", Off::UEnum::UnderlyingType, Off::UEnum::UnderlyingType != OffsetNotFound ? EOffsetSource::Scan : EOffsetSource::Unused,
+		Off::UEnum::UnderlyingType != OffsetNotFound ? "" : "this UEnum keeps no underlying type");
+
+	Off::UFunction::FunctionFlags = Found("UFunction::FunctionFlags", OffsetFinder::FindFunctionFlagsOffset());
+	Off::UFunction::ExecFunction = Found("UFunction::ExecFunction", OffsetFinder::FindFunctionNativeFuncOffset());
+
+	if (!AllFound({ Off::UClass::ClassDefaultObject, Off::UEnum::Names, Off::UFunction::FunctionFlags }))
+		return false;
+
+	/* Bytecode, checked against native functions (empty) and scripted ones (not), hence after FunctionFlags. */
+	Off::UStruct::Script = Found("UStruct::Script", OffsetFinder::FindScriptOffset());
+
+	Off::Property::ElementSize = Found("Property::ElementSize", OffsetFinder::FindElementSizeOffset());
+	Off::Property::ArrayDim = Found("Property::ArrayDim", OffsetFinder::FindArrayDimOffset());
+	Off::Property::Offset_Internal = Found("Property::Offset_Internal", OffsetFinder::FindOffsetInternalOffset());
+	Off::Property::PropertyFlags = Found("Property::PropertyFlags", OffsetFinder::FindPropertyFlagsOffset());
+
+	if (!AllFound({ Off::Property::ElementSize, Off::Property::ArrayDim, Off::Property::Offset_Internal, Off::Property::PropertyFlags }))
+		return false;
+
+	Off::BoolProperty::Base = Found("BoolProperty::Base", OffsetFinder::FindBoolPropertyBaseOffset());
+	Off::EnumProperty::Base = KindMember("EnumProperty::Base", OffsetFinder::FindEnumPropertyBaseOffset(), EClassCastFlags::EnumProperty);
+
+	/* FProperty's size is where a subclass's first member sits: EnumProperty's, checked against the
+	   property it owns, or else BoolProperty's (UE4.15 and older have no EnumProperty). */
+	const int32 PropertySize = Off::EnumProperty::Base != OffsetNotFound ? Off::EnumProperty::Base : Off::BoolProperty::Base;
+	Off::InSDK::Properties::PropertySize = Found("Property::Size", PropertySize);
+
+	if (!AllFound({ Off::BoolProperty::Base, PropertySize }))
+		return false;
+
+	Off::Property::RepIndex = Found("Property::RepIndex", OffsetFinder::FindRepIndexOffset(Off::Property::PropertyFlags, Off::Property::Offset_Internal));
+	Off::Property::BlueprintReplicationCondition = Found("Property::BlueprintReplicationCondition", OffsetFinder::FindBlueprintReplicationConditionOffset(Off::Property::RepIndex));
+	Off::Property::PropertyLinkNext = Found("Property::PropertyLinkNext", OffsetFinder::FindPropertyLinkNextOffset(Off::Property::Offset_Internal));
+	Off::Property::RepNotifyFunc = Found("Property::RepNotifyFunc", OffsetFinder::FindRepNotifyFuncOffset(Off::Property::Offset_Internal, PropertySize));
+	Off::Property::NextRef = Found("Property::NextRef", OffsetFinder::FindPropertyChainOffset(Off::Property::PropertyLinkNext, 1));
+	Off::Property::DestructorLinkNext = Found("Property::DestructorLinkNext", OffsetFinder::FindPropertyChainOffset(Off::Property::PropertyLinkNext, 2));
+	Off::Property::PostConstructLinkNext = Found("Property::PostConstructLinkNext", OffsetFinder::FindPropertyChainOffset(Off::Property::PropertyLinkNext, 3));
+
+	Off::ObjectProperty::PropertyClass = KindMember("ObjectProperty::PropertyClass", OffsetFinder::FindObjectPropertyClassOffset(PropertySize), EClassCastFlags::ObjectPropertyBase);
+	Off::ClassProperty::MetaClass = KindMember("ClassProperty::MetaClass", OffsetFinder::FindClassPropertyMetaClassOffset(Off::ObjectProperty::PropertyClass), EClassCastFlags::ClassProperty);
+	Off::ByteProperty::Enum = KindMember("ByteProperty::Enum", OffsetFinder::FindBytePropertyEnumOffset(), EClassCastFlags::ByteProperty);
+	Off::StructProperty::Struct = KindMember("StructProperty::Struct", OffsetFinder::FindStructPropertyStructOffset(PropertySize), EClassCastFlags::StructProperty);
+	Off::DelegateProperty::SignatureFunction = KindMember("DelegateProperty::SignatureFunction", OffsetFinder::FindDelegatePropertySignatureFunctionOffset(PropertySize), EClassCastFlags::DelegateProperty);
+	Off::MulticastDelegateProperty::SignatureFunction = KindMember("MulticastDelegateProperty::SignatureFunction", OffsetFinder::FindMulticastDelegatePropertySignatureFunctionOffset(PropertySize), EClassCastFlags::MulticastDelegateProperty);
+	Off::InterfaceProperty::InterfaceClass = KindMember("InterfaceProperty::InterfaceClass", OffsetFinder::FindInterfacePropertyInterfaceClassOffset(PropertySize), EClassCastFlags::InterfaceProperty);
+	Off::ArrayProperty::Inner = KindMember("ArrayProperty::Inner", OffsetFinder::FindInnerTypeOffset(PropertySize), EClassCastFlags::ArrayProperty);
+	Off::SetProperty::ElementProp = KindMember("SetProperty::ElementProp", OffsetFinder::FindSetPropertyBaseOffset(PropertySize), EClassCastFlags::SetProperty);
+	Off::MapProperty::Base = KindMember("MapProperty::Base", OffsetFinder::FindMapPropertyBaseOffset(PropertySize), EClassCastFlags::MapProperty);
+
+	/* FProperty-only kinds; their finders read FField and FFieldClass members, which a UProperty game lacks. */
+	const bool bFProperty = Settings::Internal::bUseFProperty;
+	Off::FieldPathProperty::FieldClass = KindMember("FieldPathProperty::FieldClass", bFProperty ? OffsetFinder::FindFieldPathPropertyFieldClassOffset(PropertySize) : OffsetNotFound, EClassCastFlags::FieldPathProperty);
+	Off::OptionalProperty::ValueProperty = KindMember("OptionalProperty::ValueProperty", bFProperty ? OffsetFinder::FindOptionalPropertyValuePropertyOffset(PropertySize) : OffsetNotFound, EClassCastFlags::OptionalProperty);
+
+	Off::InSDK::ULevel::Actors = Found("ULevel::Actors", OffsetFinder::FindLevelActorsOffset());
+	Off::InSDK::UDataTable::RowMap = Found("UDataTable::RowMap", OffsetFinder::FindDatatableRowMapOffset());
+
+	Off::FUObjectItem::Flags = Found("FUObjectItem::Flags", OffsetFinder::FindFUObjectItemFlagsOffset());
+
+	/* The FName layout guessed in InitFNameSettings(), checked against a NameProperty's size. */
+	const bool bFNameChecked = OffsetFinder::PostInitFNameSettings();
+	Log("FName::Size", Off::InSDK::Name::FNameSize, EOffsetSource::Scan, bFNameChecked ? "" : "not cross-checked: APlayerStart::PlayerStartTag missing");
+	Log("FName::ComparisonIndex", Off::FName::CompIdx, EOffsetSource::Default, "leads FName on every version");
+	Log("FName::Number", Off::FName::Number, Off::FName::Number != OffsetNotFound ? EOffsetSource::Scan : EOffsetSource::Unused,
+		Off::FName::Number != OffsetNotFound ? "" : "outline numbers: not stored in FName");
+
+	if (Settings::Internal::bUseFProperty)
+	{
+		/* Behind the name, so only now that FNameSize is checked. */
+		Off::FField::Flags = Found("FField::Flags", OffsetFinder::FindFFieldFlagsOffset());
 
 		Off::FField::EditorOnlyMetadata = OffsetFinder::FindFFieldEditorOnlyMetaDataOffset();
-		if (Off::FField::EditorOnlyMetadata != OffsetFinder::OffsetNotFound)
-			std::cerr << std::format("Off::FField::EditorOnlyMetadata: 0x{:X}\n", Off::FField::EditorOnlyMetadata);
-
-		Off::FFieldClass::CastFlags = OffsetFinder::FindFieldClassCastFlagsOffset();
-		std::cerr << std::format("Off::FFieldClass::CastFlags: 0x{:X}\n\n", Off::FFieldClass::CastFlags);
+		Log("FField::EditorOnlyMetadata", Off::FField::EditorOnlyMetadata, Off::FField::EditorOnlyMetadata != OffsetNotFound ? EOffsetSource::Scan : EOffsetSource::Unused,
+			Off::FField::EditorOnlyMetadata != OffsetNotFound ? "" : "editor builds only");
 	}
 
-	Off::UClass::ClassDefaultObject = OffsetFinder::FindDefaultObjectOffset();
-	std::cerr << std::format("Off::UClass::ClassDefaultObject: 0x{:X}\n", Off::UClass::ClassDefaultObject);
+	Off::FInstancedStruct::ScriptStruct = Log("FInstancedStruct::ScriptStruct", 0x0, EOffsetSource::Default, "StructUtils layout (UE5); emitted only when the struct is 0x10+");
+	Off::FInstancedStruct::StructMemory = Log("FInstancedStruct::StructMemory", sizeof(void*), EOffsetSource::Default, "StructUtils layout (UE5); emitted only when the struct is 0x10+");
 
-	Off::UClass::ImplementedInterfaces = OffsetFinder::FindImplementedInterfacesOffset();
-	std::cerr << std::format("Off::UClass::ImplementedInterfaces: 0x{:X}\n", Off::UClass::ImplementedInterfaces);
-
-	Off::UEnum::Names = OffsetFinder::FindEnumNamesOffset();
-	std::cerr << std::format("Off::UEnum::Names: 0x{:X}\n", Off::UEnum::Names) << std::endl;
-
-	Off::UEnum::UnderlyingType = OffsetFinder::FindEnumUnderlayingTypeOffset();
-
-	if (Settings::Internal::bHasUnderlayingTypeInUEnum)
-		std::cerr << std::format("Off::UEnum::UnderlyingType: 0x{:X}\n", Off::UEnum::UnderlyingType) << std::endl;
-
-	Off::UFunction::FunctionFlags = OffsetFinder::FindFunctionFlagsOffset();
-	std::cerr << std::format("Off::UFunction::FunctionFlags: 0x{:X}\n", Off::UFunction::FunctionFlags);
-
-	Off::UFunction::ExecFunction = OffsetFinder::FindFunctionNativeFuncOffset();
-	std::cerr << std::format("Off::UFunction::ExecFunction: 0x{:X}\n", Off::UFunction::ExecFunction) << std::endl;
-
-	Off::Property::ElementSize = OffsetFinder::FindElementSizeOffset();
-	std::cerr << std::format("Off::Property::ElementSize: 0x{:X}\n", Off::Property::ElementSize);
-
-	Off::Property::ArrayDim = OffsetFinder::FindArrayDimOffset();
-	std::cerr << std::format("Off::Property::ArrayDim: 0x{:X}\n", Off::Property::ArrayDim);
-
-	Off::Property::Offset_Internal = OffsetFinder::FindOffsetInternalOffset();
-	std::cerr << std::format("Off::Property::Offset_Internal: 0x{:X}\n", Off::Property::Offset_Internal);
-
-	Off::Property::PropertyFlags = OffsetFinder::FindPropertyFlagsOffset();
-	std::cerr << std::format("Off::Property::PropertyFlags: 0x{:X}\n", Off::Property::PropertyFlags);
-
-	Off::Property::RepIndex = OffsetFinder::FindRepIndexOffset(Off::Property::PropertyFlags);
-	std::cerr << std::format("Off::Property::RepIndex: 0x{:X}\n", Off::Property::RepIndex);
-
-	Off::Property::BlueprintReplicationCondition = OffsetFinder::FindBlueprintReplicationConditionOffset(Off::Property::RepIndex);
-	std::cerr << std::format("Off::Property::BlueprintReplicationCondition: 0x{:X}\n", Off::Property::BlueprintReplicationCondition);
-
-	Off::Property::PropertyLinkNext = OffsetFinder::FindPropertyLinkNextOffset(Off::Property::Offset_Internal);
-	if (Off::Property::PropertyLinkNext == OffsetFinder::OffsetNotFound)
-	{
-		Off::Property::PropertyLinkNext = (Off::Property::Offset_Internal + sizeof(int32) + Off::InSDK::Name::FNameSize + 7) & ~7;
-		std::cerr << "Dumper-7 WARNING: FProperty::PropertyLinkNext not found by FGuid's link chain - the UE4 layout is assumed.\n";
-	}
-	std::cerr << std::format("Off::Property::PropertyLinkNext: 0x{:X}\n", Off::Property::PropertyLinkNext);
-
-	Off::Property::RepNotifyFunc = OffsetFinder::FindRepNotifyFuncOffset(Off::Property::Offset_Internal, Off::Property::PropertyLinkNext);
-	std::cerr << std::format("Off::Property::RepNotifyFunc: 0x{:X}\n", Off::Property::RepNotifyFunc);
-
-	Off::Property::NextRef = OffsetFinder::FindNextRefOffset(Off::Property::PropertyLinkNext);
-	std::cerr << std::format("Off::Property::NextRef: 0x{:X}\n", Off::Property::NextRef);
-
-	Off::Property::DestructorLinkNext = OffsetFinder::FindDestructorLinkNextOffset(Off::Property::NextRef);
-	std::cerr << std::format("Off::Property::DestructorLinkNext: 0x{:X}\n", Off::Property::DestructorLinkNext);
-
-	Off::Property::PostConstructLinkNext = OffsetFinder::FindPostConstructLinkNextOffset(Off::Property::DestructorLinkNext);
-	std::cerr << std::format("Off::Property::PostConstructLinkNext: 0x{:X}\n", Off::Property::PostConstructLinkNext);
-
-	Off::BoolProperty::Base = OffsetFinder::FindBoolPropertyBaseOffset();
-	std::cerr << std::format("UBoolProperty::Base: 0x{:X}\n", Off::BoolProperty::Base) << std::endl;
-
-	Off::EnumProperty::Base = OffsetFinder::FindEnumPropertyBaseOffset();
-	std::cerr << std::format("Off::EnumProperty::Base: 0x{:X}\n", Off::EnumProperty::Base) << std::endl;
-
-
-	if (Off::EnumProperty::Base == OffsetFinder::OffsetNotFound)
-	{
-		Off::InSDK::Properties::PropertySize = Off::BoolProperty::Base;
-		Off::EnumProperty::Base = Off::BoolProperty::Base;
-	}
-	else
-	{
-		Off::InSDK::Properties::PropertySize = Off::EnumProperty::Base;
-	}
-
-	std::cerr << std::format("UPropertySize: 0x{:X}\n", Off::InSDK::Properties::PropertySize) << std::endl;
-
-	Off::ObjectProperty::PropertyClass = OffsetFinder::FindObjectPropertyClassOffset();
-	std::cerr << std::format("Off::ObjectProperty::PropertyClass: 0x{:X}", Off::ObjectProperty::PropertyClass) << std::endl;
-	OverwriteIfInvalidOffset(Off::ObjectProperty::PropertyClass, Off::InSDK::Properties::PropertySize);
-
-	Off::ByteProperty::Enum = OffsetFinder::FindBytePropertyEnumOffset();
-	OverwriteIfInvalidOffset(Off::ByteProperty::Enum, Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::ByteProperty::Enum: 0x{:X}", Off::ByteProperty::Enum) << std::endl;
-
-	Off::StructProperty::Struct = OffsetFinder::FindStructPropertyStructOffset();
-	OverwriteIfInvalidOffset(Off::StructProperty::Struct, Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::StructProperty::Struct: 0x{:X}\n", Off::StructProperty::Struct) << std::endl;
-
-	Off::DelegateProperty::SignatureFunction = OffsetFinder::FindDelegatePropertySignatureFunctionOffset();
-	OverwriteIfInvalidOffset(Off::DelegateProperty::SignatureFunction, Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::DelegateProperty::SignatureFunction: 0x{:X}\n", Off::DelegateProperty::SignatureFunction) << std::endl;
-
-	Off::ArrayProperty::Inner = OffsetFinder::FindInnerTypeOffset(Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::ArrayProperty::Inner: 0x{:X}\n", Off::ArrayProperty::Inner);
-
-	Off::SetProperty::ElementProp = OffsetFinder::FindSetPropertyBaseOffset(Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::SetProperty::ElementProp: 0x{:X}\n", Off::SetProperty::ElementProp);
-
-	Off::MapProperty::Base = OffsetFinder::FindMapPropertyBaseOffset(Off::InSDK::Properties::PropertySize);
-	std::cerr << std::format("Off::MapProperty::Base: 0x{:X}\n", Off::MapProperty::Base) << std::endl;
-
-	Off::InSDK::ULevel::Actors = OffsetFinder::FindLevelActorsOffset();
-	std::cerr << std::format("Off::InSDK::ULevel::Actors: 0x{:X}\n", Off::InSDK::ULevel::Actors) << std::endl;
-
-	Off::InSDK::UDataTable::RowMap = OffsetFinder::FindDatatableRowMapOffset();
-	std::cerr << std::format("Off::InSDK::UDataTable::RowMap: 0x{:X}\n", Off::InSDK::UDataTable::RowMap) << std::endl;
-
-	Off::InterfaceProperty::InterfaceClass = Off::DelegateProperty::SignatureFunction;
-	std::cerr << std::format("Off::InterfaceProperty::InterfaceClass: 0x{:X}\n", Off::InterfaceProperty::InterfaceClass) << std::endl;
-
-	Off::MulticastDelegateProperty::SignatureFunction = Off::DelegateProperty::SignatureFunction;
-	std::cerr << std::format("Off::MulticastDelegateProperty::SignatureFunction: 0x{:X}\n", Off::MulticastDelegateProperty::SignatureFunction) << std::endl;
-
-	OffsetFinder::PostInitFNameSettings();
-
-	std::cerr << std::endl;
-
-	Off::FieldPathProperty::FieldClass = OffsetFinder::FindFieldPathPropertyFieldClassOffset(Off::InSDK::Properties::PropertySize);
-	Off::OptionalProperty::ValueProperty = OffsetFinder::FindOptionalPropertyValuePropertyOffset(Off::InSDK::Properties::PropertySize);
-
-	Off::ClassProperty::MetaClass = Off::ObjectProperty::PropertyClass + sizeof(void*); //0x8 inheritance from ObjectProperty
-
-	Off::FInstancedStruct::ScriptStruct = 0x00;
-	Off::FInstancedStruct::StructMemory = Off::FInstancedStruct::ScriptStruct + sizeof(void*);
+	return true;
 }
 
 void PropertySizes::Init()
 {
-	InitTDelegateSize();
-	InitFFieldPathSize();
-	InitTMulticastInlineDelegateSize();
-}
+	/* Each size is the ElementSize of a live property of that kind. Where the game has none, the default
+	   stays for the SDK's type and no member of that kind is dumped. */
+	auto Measure = [](const char* Name, EClassCastFlags Kind, int32& Size)
+	{
+		const std::vector<UEProperty> Samples = OffsetFinder::SampleProperties(Kind, 1);
 
-void PropertySizes::InitTDelegateSize()
-{
-	/* If the AudioComponent class or the OnQueueSubtitles member weren't found, fallback to looping GObjects and looking for a Delegate. */
-	auto OnPropertyNotFound = [&]() -> void
+		if (Samples.empty())
 		{
-			for (UEObject Obj : ObjectArray())
-			{
-				if (!Obj.IsA(EClassCastFlags::Struct))
-					continue;
+			Off::Log(Name, Size, EOffsetSource::Default, "no property of this kind to measure");
+			return;
+		}
 
-				for (UEProperty Prop : Obj.Cast<UEClass>().GetProperties())
-				{
-					if (Prop.IsA(EClassCastFlags::DelegateProperty))
-					{
-						PropertySizes::DelegateProperty = Prop.GetSize();
-						return;
-					}
-				}
-			}
-		};
+		Size = Samples[0].GetSize();
+		Off::Log(Name, Size, EOffsetSource::Scan);
+	};
 
-	const UEClass AudioComponentClass = ObjectArray::FindClassFast("AudioComponent");
+	Measure("Size::FScriptDelegate", EClassCastFlags::DelegateProperty, DelegateProperty);
+	Measure("Size::FMulticastInlineDelegate", EClassCastFlags::MulticastInlineDelegateProperty, MulticastInlineDelegateProperty);
 
-	if (!AudioComponentClass)
-		return OnPropertyNotFound();
-
-	const UEProperty OnQueueSubtitlesProp = AudioComponentClass.FindMember("OnQueueSubtitles", EClassCastFlags::DelegateProperty);
-
-	if (!OnQueueSubtitlesProp)
-		return OnPropertyNotFound();
-
-	PropertySizes::DelegateProperty = OnQueueSubtitlesProp.GetSize();
-}
-
-void PropertySizes::InitFFieldPathSize()
-{
-	if (!Settings::Internal::bUseFProperty)
-		return;
-
-	/* If the SetFieldPathPropertyByName function or the Value parameter weren't found, fallback to looping GObjects and looking for a Delegate. */
-	auto OnPropertyNotFound = [&]() -> void
-		{
-			for (UEObject Obj : ObjectArray())
-			{
-				if (!Obj.IsA(EClassCastFlags::Struct))
-					continue;
-
-				for (UEProperty Prop : Obj.Cast<UEClass>().GetProperties())
-				{
-					if (Prop.IsA(EClassCastFlags::FieldPathProperty))
-					{
-						PropertySizes::FieldPathProperty = Prop.GetSize();
-						return;
-					}
-				}
-			}
-		};
-
-	const UEFunction SetFieldPathPropertyByNameFunc = ObjectArray::FindObjectFast<UEFunction>("SetFieldPathPropertyByName", EClassCastFlags::Function);
-
-	if (!SetFieldPathPropertyByNameFunc)
-		return OnPropertyNotFound();
-
-	const UEProperty ValueParamProp = SetFieldPathPropertyByNameFunc.FindMember("Value", EClassCastFlags::FieldPathProperty);
-
-	if (!ValueParamProp)
-		return OnPropertyNotFound();
-
-	PropertySizes::FieldPathProperty = ValueParamProp.GetSize();
-}
-
-void PropertySizes::InitTMulticastInlineDelegateSize()
-{
-	/* If the AudioComponent class or the OnQueueSubtitles member weren't found, fallback to looping GObjects and looking for a Delegate. */
-	auto OnPropertyNotFound = [&]() -> void
-		{
-			for (UEObject Obj : ObjectArray())
-			{
-				if (!Obj.IsA(EClassCastFlags::Struct))
-					continue;
-
-				for (UEProperty Prop : Obj.Cast<UEClass>().GetProperties())
-				{
-					if (Prop.IsA(EClassCastFlags::MulticastInlineDelegateProperty))
-					{
-						PropertySizes::DelegateProperty = Prop.GetSize();
-						return;
-					}
-				}
-			}
-		};
-
-	const UEClass EmitterClass = ObjectArray::FindClassFast("Emitter");
-
-	if (!EmitterClass)
-		return OnPropertyNotFound();
-
-	const UEProperty OnParticleSpawn = EmitterClass.FindMember("OnParticleSpawn", EClassCastFlags::MulticastDelegateProperty);
-
-	if (!OnParticleSpawn)
-		return OnPropertyNotFound();
-
-	PropertySizes::MulticastInlineDelegateProperty = OnParticleSpawn.GetSize();
+	if (Settings::Internal::bUseFProperty)
+		Measure("Size::FFieldPath", EClassCastFlags::FieldPathProperty, FieldPathProperty);
 }

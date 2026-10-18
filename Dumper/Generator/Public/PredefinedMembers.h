@@ -69,6 +69,13 @@ struct PredefinedStruct
 /* unordered_map<StructIndex, Members/Functions> */
 using PredefinedMemberLookupMapType = std::unordered_map<int32 /* StructIndex */, PredefinedElements /* Members/Functions */>;
 
+/* Drops the members whose offset was not found on this build (-1 in the offset table), so none is
+   emitted at a guessed place. Static and zero-size members have no offset and stay. */
+inline void DropMembersAtMissingOffsets(std::vector<PredefinedMember>& Members)
+{
+    std::erase_if(Members, [](const PredefinedMember& Member) { return !Member.bIsStatic && !Member.bIsZeroSizeMember && Member.Offset == -1; });
+}
+
 // requires strict weak ordering
 inline bool CompareUnrealProperties(UEProperty Left, UEProperty Right)
 {

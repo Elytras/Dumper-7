@@ -1,9 +1,8 @@
 # Dumper-7 hardening: work in progress
 
-Branch `claude/heuristic-germain-e69887`, on main 36830c0. **Not merged. It does not build yet**: `Off::Init` in
-`Offsets.cpp` is still the old version and calls finders whose signatures changed. Nothing here has been verified
-by a dump. The draft of the new `Off::Init` + `PropertySizes::Init` is `HARDENING-offinit-draft.cpp.txt`, and it
-needs the revisions in step 2 below.
+Branch `claude/heuristic-germain-e69887`, on main 36830c0. **Not merged.** Steps 1-5 below are done and the
+branch builds (`modcli build(target="dumper")`, with a copy of the untracked `build.ps1` in the worktree root).
+**Nothing has been verified by a dump yet. Next: step 6.**
 
 Goal: no layout field is read without a finder or a logged, version-gated default. A wrong offset should degrade
 the dump, never crash the game. Every offset is logged with how it was found.

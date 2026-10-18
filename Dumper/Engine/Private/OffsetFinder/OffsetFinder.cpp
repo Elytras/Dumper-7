@@ -42,9 +42,7 @@ bool OffsetFinder::IsPropertyOwnedBy(const void* Ptr, const void* Owner)
 	return OwnerValue == reinterpret_cast<uintptr_t>(Owner);
 }
 
-/* Up to Max properties of one kind, from the structs in GObjects in index order. The finders for the
-   members a property subclass adds check their candidate slot against these. */
-static std::vector<UEProperty> SampleProperties(EClassCastFlags Type, size_t Max)
+std::vector<UEProperty> OffsetFinder::SampleProperties(EClassCastFlags Type, size_t Max)
 {
 	std::vector<UEProperty> Samples;
 
@@ -97,7 +95,7 @@ static int32 FindOwnedPropertySlot(EClassCastFlags Type, int32 PropertySize, int
 	if (PropertySize == OffsetFinder::OffsetNotFound)
 		return OffsetFinder::OffsetNotFound;
 
-	const std::vector<UEProperty> Samples = SampleProperties(Type, 8);
+	const std::vector<UEProperty> Samples = OffsetFinder::SampleProperties(Type, 8);
 
 	for (int32 Offset = PropertySize; !Samples.empty() && Offset <= PropertySize + static_cast<int32>(sizeof(void*)); Offset += sizeof(void*))
 	{
@@ -648,16 +646,12 @@ int32_t OffsetFinder::FindFFieldNameOffset()
 	UEFField GuidChild = ObjectArray::FindStructFast("Guid").GetChildProperties();
 	UEFField VectorChild = ObjectArray::FindStructFast("Vector").GetChildProperties();
 
-	std::string GuidChildName = GuidChild.GetName();
-	std::string VectorChildName = VectorChild.GetName();
-
-	if ((GuidChildName == "A" || GuidChildName == "D") && (VectorChildName == "X" || VectorChildName == "Z"))
-		return Off::FField::Name;
-
-	for (Off::FField::Name = Off::FField::Owner; Off::FField::Name < 0x40; Off::FField::Name += 4)
+	/* The name follows Next on every version, so the owner and link pointers before it are never
+	   handed to the name lookup as an index. */
+	for (Off::FField::Name = Off::FField::Next + sizeof(void*); Off::FField::Name < 0x40; Off::FField::Name += 4)
 	{
-		GuidChildName = GuidChild.GetName();
-		VectorChildName = VectorChild.GetName();
+		const std::string GuidChildName = GuidChild.GetName();
+		const std::string VectorChildName = VectorChild.GetName();
 
 		if ((GuidChildName == "A" || GuidChildName == "D") && (VectorChildName == "X" || VectorChildName == "Z"))
 			return Off::FField::Name;
@@ -942,7 +936,7 @@ int32_t OffsetFinder::FindEnumNamesOffset()
 	if (UEnumNumValuesOffset == OffsetNotFound)
 		return OffsetNotFound;
 
-	InializeUEnumSettings(Infos[0].first, UEnumNumValuesOffset);
+	InializeUEnumSettings(Infos[0].first ? Infos[0].first : Infos[1].first, UEnumNumValuesOffset);
 
 	return UEnumNumValuesOffset - sizeof(void*);
 }
@@ -1214,6 +1208,9 @@ int32_t OffsetFinder::FindImplementedInterfacesOffset()
 	UEClass Interface_AssetUserDataClass = ObjectArray::FindClassFast("Interface_AssetUserData");
 
 	const uint8_t* ActorComponentClassPtr = reinterpret_cast<const uint8_t*>(ObjectArray::FindClassFast("ActorComponent").GetAddress());
+
+	if (!Interface_AssetUserDataClass || !ActorComponentClassPtr)
+		return OffsetNotFound;
 
 	for (int i = Off::UClass::ClassDefaultObject; i <= (0x350 - 0x10); i += sizeof(void*))
 	{
@@ -1747,14 +1744,25 @@ int32 OffsetFinder::FindLevelActorsOffset()
 	const int32 SearchStart = UObjectClass.GetStructSize() + FURLStruct.GetStructSize();
 	const int32 SearchEnd = Level_OwningWorldProperty.GetOffset();
 
+	/* The first array there whose first non-null element is a live Actor: the level's WorldSettings
+	   (Actors[0]) or another actor, never something that merely looks like an array. */
+	auto HoldsActors = [](const TArray<void*>& Array)
+	{
+		for (int32 i = 0; i < Array.Num() && i < 8; i++)
+		{
+			if (Array[i])
+				return IsLiveObject(Array[i]) && UEObject(Array[i]).IsA(EClassCastFlags::Actor);
+		}
+
+		return false;
+	};
+
 	for (int i = SearchStart; i <= (SearchEnd - 0x10); i += sizeof(void*))
 	{
 		const TArray<void*>& ActorArray = *reinterpret_cast<TArray<void*>*>(Lvl + i);
 
-		if (ActorArray.IsValid() && !Platform::IsBadReadPtr(ActorArray.GetDataPtr()))
-		{
+		if (ActorArray.IsValid() && !Platform::IsBadReadPtr(ActorArray.GetDataPtr()) && HoldsActors(ActorArray))
 			return i;
-		}
 	}
 
 	return OffsetNotFound;

@@ -451,7 +451,10 @@ void IDAMappingGenerator::InitPredefinedMembers()
 	InitCorePredefinedMembers(PredefinedMembers);
 
 	for (auto& [Index, Predefs] : PredefinedMembers)
+	{
+		DropMembersAtMissingOffsets(Predefs.Members);
 		std::sort(Predefs.Members.begin(), Predefs.Members.end(), ComparePredefinedMembers);
+	}
 }
 
 #define IDA_MEMBER_AT(IdaType, NameStr, OffsetExpr, SizeExpr, AlignExpr) \
@@ -644,18 +647,24 @@ uint32 IDAMappingGenerator::GeneratePredefinedTypes(std::stringstream& StructDat
 		};
 	}
 
-	// FField: { void* VTable; FFieldClass* ClassPrivate; FFieldVariant Owner; FField* Next; FName Name; int32 ObjFlags; }
+	/* FField: { void* VTable; FFieldClass* ClassPrivate; FFieldVariant Owner; FField* Next; FName Name; int32 ObjFlags; }
+	   at the offsets found for it: FFieldVariant is one pointer since 5.1.1 and a pointer plus a bool before. */
 	if (Settings::Internal::bUseFProperty)
 	{
-		PredefinedStruct& T = AddPredef("FField", PtrSize * 4 + FNameSize + (int32)sizeof(int32), PtrSize);
+		const bool bHasFlags = Off::FField::Flags != -1;
+		const int32 FieldSize = bHasFlags ? Off::FField::Flags + (int32)sizeof(int32) : Off::FField::Name + FNameSize;
+
+		PredefinedStruct& T = AddPredef("FField", FieldSize, PtrSize);
 		T.Properties = {
-			IDA_MEMBER_AT("void*",          "VTable",       0,                       PtrSize,       alignof(void*)),
-			IDA_MEMBER_AT("void*",          "ClassPrivate", PtrSize,                 PtrSize,       alignof(void*)),
-			IDA_MEMBER_AT("void*",          "Owner",        PtrSize * 2,             PtrSize,       alignof(void*)),
-			IDA_MEMBER_AT("struct FField*", "Next",         PtrSize * 3,             PtrSize,       alignof(void*)),
-			IDA_MEMBER_AT("struct FName",   "Name",         PtrSize * 4,             FNameSize,     alignof(int32)),
-			IDA_MEMBER_AT("int32",          "ObjFlags",     PtrSize * 4 + FNameSize, sizeof(int32), alignof(int32)),
+			IDA_MEMBER_AT("void*",          "VTable",       Off::FField::Vft,   PtrSize,   alignof(void*)),
+			IDA_MEMBER_AT("void*",          "ClassPrivate", Off::FField::Class, PtrSize,   alignof(void*)),
+			IDA_MEMBER_AT("void*",          "Owner",        Off::FField::Owner, PtrSize,   alignof(void*)),
+			IDA_MEMBER_AT("struct FField*", "Next",         Off::FField::Next,  PtrSize,   alignof(void*)),
+			IDA_MEMBER_AT("struct FName",   "Name",         Off::FField::Name,  FNameSize, alignof(int32)),
 		};
+
+		if (bHasFlags)
+			T.Properties.push_back(IDA_MEMBER_AT("int32", "ObjFlags", Off::FField::Flags, sizeof(int32), alignof(int32)));
 	}
 
 	// FText
@@ -740,7 +749,9 @@ bool IDAMappingGenerator::GenerateVTableName(std::stringstream& VTableData, std:
 	const UEClass Class = DefaultObject.GetClass();
 	const UEClass Super = Class.GetSuper().Cast<UEClass>();
 
-	if (Super && DefaultObject.GetVft() == Super.GetDefaultObject().GetVft())
+	const UEObject SuperDefault = Super ? Super.GetDefaultObject() : nullptr;
+
+	if (SuperDefault && DefaultObject.GetVft() == SuperDefault.GetVft())
 		return false;
 
 	IDAMappingsLayouts::NamedVTable Variable;
@@ -806,6 +817,9 @@ void IDAMappingGenerator::GenerateClassFunctions(std::stringstream& ExecFuncData
 			continue;
 
 		const UEFunction Func = WrappedFunc.GetUnrealFunction();
+
+		if (!Func.GetExecFunction())
+			continue;
 
 		const std::string MangledName = MangleUFunctionName(Class.GetCppName(), Func.GetValidName());
 		const uint32 Offset = static_cast<uint32>(Platform::GetOffset(Func.GetExecFunction()));

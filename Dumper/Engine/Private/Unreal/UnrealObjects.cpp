@@ -511,10 +511,13 @@ std::vector<std::pair<FName, int64>> UEEnum::GetNameValuePairs() const
 
 		if (!bIsNamesPtrTagged)
 		{
-			/* StaticNamesUTF8 (untagged) is not supported yet. See: https://github.com/EpicGames/UnrealEngine/blob/ue5-main/Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h#L3408 */
-			std::cerr << "Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is NOT tagged (StaticNamesUTF8 type). This is not supported yet!" << std::endl;
-			Sleep(100'000);
-			exit(1);
+			/* StaticNamesUTF8 (untagged) is not supported yet: the enum is dumped without values rather than
+			   taking the game down. See: https://github.com/EpicGames/UnrealEngine/blob/ue5-main/Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h#L3408 */
+			static bool bWarned = false;
+			if (!std::exchange(bWarned, true))
+				std::cerr << "Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is NOT tagged (StaticNamesUTF8 type), not supported yet - such enums are dumped without values." << std::endl;
+
+			return Ret;
 		}
 
 		const int64* Values = reinterpret_cast<int64*>(*reinterpret_cast<uintptr_t*>(Object + EnumNamesOffset + 0x8) & PointerMaskNoTag);
@@ -824,6 +827,9 @@ bool UEFunction::HasFlags(EFunctionFlags FuncFlags) const
 
 void* UEFunction::GetExecFunction() const
 {
+	if (Off::UFunction::ExecFunction == -1)
+		return nullptr;
+
 	return *reinterpret_cast<void**>(Object + Off::UFunction::ExecFunction);
 }
 
@@ -1299,8 +1305,13 @@ std::string UEProperty::StringifyFlags() const
 	return Flags;
 }
 
+/* The getters below return null where Off::Init() logged the member missing; every caller already
+   handles a null enum, class, function or field class. */
 UEEnum UEByteProperty::GetEnum() const
 {
+	if (Off::ByteProperty::Enum == -1)
+		return nullptr;
+
 	return UEEnum(*reinterpret_cast<void**>(Base + Off::ByteProperty::Enum));
 }
 
@@ -1367,12 +1378,18 @@ std::string UEObjectProperty::GetCppType() const
 
 UEClass UEClassProperty::GetMetaClass() const
 {
+	if (Off::ClassProperty::MetaClass == -1)
+		return nullptr;
+
 	return UEClass(*reinterpret_cast<void**>(Base + Off::ClassProperty::MetaClass));
 }
 
 std::string UEClassProperty::GetCppType() const
 {
-	return HasPropertyFlags(EPropertyFlags::UObjectWrapper) ? std::format("TSubclassOf<class {}>", GetMetaClass().GetCppName()) : "class UClass*";
+	if (!HasPropertyFlags(EPropertyFlags::UObjectWrapper))
+		return "class UClass*";
+
+	return std::format("TSubclassOf<class {}>", GetMetaClass() ? GetMetaClass().GetCppName() : "UObject");
 }
 
 std::string UEWeakObjectProperty::GetCppType() const
@@ -1395,9 +1412,17 @@ std::string UESoftClassProperty::GetCppType() const
 	return std::format("TSoftClassPtr<class {}>", GetMetaClass() ? GetMetaClass().GetCppName() : GetPropertyClass().GetCppName());
 }
 
+UEClass UEInterfaceProperty::GetPropertyClass() const
+{
+	if (Off::InterfaceProperty::InterfaceClass == -1)
+		return nullptr;
+
+	return UEClass(*reinterpret_cast<void**>(Base + Off::InterfaceProperty::InterfaceClass));
+}
+
 std::string UEInterfaceProperty::GetCppType() const
 {
-	return std::format("TScriptInterface<class {}>", GetPropertyClass().GetCppName());
+	return std::format("TScriptInterface<class {}>", GetPropertyClass() ? GetPropertyClass().GetCppName() : "IInterface");
 }
 
 UEStruct UEStructProperty::GetUnderlayingStruct() const
@@ -1422,6 +1447,9 @@ std::string UEArrayProperty::GetCppType() const
 
 UEFunction UEDelegateProperty::GetSignatureFunction() const
 {
+	if (Off::DelegateProperty::SignatureFunction == -1)
+		return nullptr;
+
 	return UEFunction(*reinterpret_cast<void**>(Base + Off::DelegateProperty::SignatureFunction));
 }
 
@@ -1432,8 +1460,11 @@ std::string UEDelegateProperty::GetCppType() const
 
 UEFunction UEMulticastInlineDelegateProperty::GetSignatureFunction() const
 {
-	// Uses "Off::DelegateProperty::SignatureFunction" on purpose
-	return UEFunction(*reinterpret_cast<void**>(Base + Off::DelegateProperty::SignatureFunction));
+	/* FMulticastDelegateProperty's own member, shared by the inline and sparse kinds. */
+	if (Off::MulticastDelegateProperty::SignatureFunction == -1)
+		return nullptr;
+
+	return UEFunction(*reinterpret_cast<void**>(Base + Off::MulticastDelegateProperty::SignatureFunction));
 }
 
 std::string UEMulticastInlineDelegateProperty::GetCppType() const
@@ -1486,12 +1517,15 @@ std::string UEEnumProperty::GetCppType() const
 
 UEFFieldClass UEFieldPathProperty::GetFieldClass() const
 {
+	if (Off::FieldPathProperty::FieldClass == -1)
+		return nullptr;
+
 	return UEFFieldClass(*reinterpret_cast<void**>(Base + Off::FieldPathProperty::FieldClass));
 }
 
 std::string UEFieldPathProperty::GetCppType() const
 {
-	return std::format("TFieldPath<struct {}>", GetFieldClass().GetCppName());
+	return std::format("TFieldPath<struct {}>", GetFieldClass() ? GetFieldClass().GetCppName() : "FField");
 }
 
 UEProperty UEOptionalProperty::GetValueProperty() const

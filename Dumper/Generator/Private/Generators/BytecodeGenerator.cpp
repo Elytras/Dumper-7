@@ -2,14 +2,12 @@
 #include <format>
 
 #include "Generators/BytecodeGenerator.h"
+#include "OffsetFinder/Offsets.h"
 #include "Settings.h"
 
 
 namespace
 {
-    // UStruct::Script (TArray<uint8>): Data@+0x60, ArrayNum@+0x68. Engine-universal (UE4/UE5).
-    constexpr int32 ScriptOffset = 0x60;
-
     // Skip/jump offsets in modern UE bytecode are 32-bit (CodeSkipSizeType == uint32).
     using CodeSkipSizeType = uint32;
 
@@ -528,9 +526,13 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
 
 void BytecodeGenerator::DisassembleFunction(UEFunction Func, std::vector<FInsn>& Out)
 {
+    /* UStruct::Script (TArray<uint8>), where Off::Init() found it; nothing is read if it didn't. */
+    if (Off::UStruct::Script == -1)
+        return;
+
     auto* Base = reinterpret_cast<uint8*>(Func.GetAddress());
-    const uint8* Data = *reinterpret_cast<uint8**>(Base + ScriptOffset);
-    const int32 Num = *reinterpret_cast<int32*>(Base + ScriptOffset + 0x8);
+    const uint8* Data = *reinterpret_cast<uint8**>(Base + Off::UStruct::Script);
+    const int32 Num = *reinterpret_cast<int32*>(Base + Off::UStruct::Script + 0x8);
 
     if (!Data || Num <= 0)
         return;   // native function, no bytecode

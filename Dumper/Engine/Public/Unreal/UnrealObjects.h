@@ -394,6 +394,9 @@ class UEInterfaceProperty : public UEObjectProperty
 	using UEObjectProperty::UEObjectProperty;
 
 public:
+	/* FInterfaceProperty::InterfaceClass: its own member, not FObjectPropertyBase's PropertyClass. */
+	UEClass GetPropertyClass() const;
+
 	std::string GetCppType() const;
 };
 

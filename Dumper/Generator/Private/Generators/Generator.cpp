@@ -23,7 +23,7 @@ inline void InitSettings()
 }
 
 
-void Generator::InitEngineCore()
+bool Generator::InitEngineCore()
 {
 	/* manual override */
 	//ObjectArray::Init(/*GObjects*/, /*Layout = Default*/); // FFixedUObjectArray (UEVersion < UE4.21)
@@ -54,7 +54,23 @@ void Generator::InitEngineCore()
 
 	CALL_PLATFORM_SPECIFIC_FUNCTION(FName::Init);
 
-	Off::Init();
+	/* A missing essential offset means the generators would read through a guess: stop here, before
+	   anything is hooked or dumped. */
+	const bool bOffsetsComplete = Off::Init();
+	const std::vector<std::string> MissingEssentials = Off::MissingEssentials();
+
+	if (!bOffsetsComplete || !MissingEssentials.empty())
+	{
+		Off::PrintSummary();
+
+		std::cerr << "[Dumper-7] Not dumping: essential offsets missing on this build:";
+		for (const std::string& Name : MissingEssentials)
+			std::cerr << " " << Name;
+		std::cerr << (bOffsetsComplete ? "" : " (offset init stopped at the first one)") << "\n";
+
+		return false;
+	}
+
 	PropertySizes::Init();
 
 	CALL_PLATFORM_SPECIFIC_FUNCTION(Off::InSDK::ProcessEvent::InitPE); // Must be at this position, relies on offsets initialized in Off::Init()
@@ -73,7 +89,43 @@ void Generator::InitEngineCore()
 	Off::InSDK::WeakObject::InitAllocateSerialNumber();      // Pure signature scan; no engine deps
 	Off::InSDK::TypeHash::InitTypeHashFunctions();           // Pure signature scan; no engine deps (SDK GetTypeHash)
 
+	/* The function and global addresses found above, module-relative, so the table shows which
+	   signature scans a game update broke. */
+	Off::Log("ProcessEvent::Index", Off::InSDK::ProcessEvent::PEIndex, EOffsetSource::Scan);
+	Off::Log("UGameEngine::Tick::Index", Off::InSDK::Engine::UGameEngineTickIndex,
+		Off::InSDK::Engine::UGameEngineTickIndex != -1 ? EOffsetSource::Scan : EOffsetSource::Missing);
+
+	const std::pair<const char*, int32> Addresses[] =
+	{
+		{ "ProcessEvent", Off::InSDK::ProcessEvent::PEOffset },
+		{ "GMalloc", Off::InSDK::GMalloc::GMallocOffset },
+		{ "GWorld", Off::InSDK::World::GWorld },
+		{ "FName::FName(wchar_t*)", Off::InSDK::Name::FNameCtorWcharOffset },
+		{ "FText::FText(FString)", Off::InSDK::Text::FTextCtorFStringOffset },
+		{ "UGameEngine::Tick", Off::InSDK::Engine::UGameEngineTickOffset },
+		{ "StaticConstructObject_Internal", Off::InSDK::Construct::StaticConstructObjectInternalOffset },
+		{ "FFrame::Step", Off::InSDK::ScriptVM::FFrameStepOffset },
+		{ "FFrame::StepExplicitProperty", Off::InSDK::ScriptVM::FFrameStepExplicitPropertyOffset },
+		{ "GNatives", Off::InSDK::ScriptVM::GNativesOffset },
+		{ "FScriptMapHelper::FindOrAdd", Off::InSDK::ScriptContainers::FScriptMapHelperFindOrAddOffset },
+		{ "FScriptMapHelper::RemoveAt", Off::InSDK::ScriptContainers::FScriptMapHelperRemoveAtOffset },
+		{ "FScriptMapHelper::FindMapPairIndexFromHash", Off::InSDK::ScriptContainers::FScriptMapHelperFindPairIndexOffset },
+		{ "FScriptSetHelper::RemoveElement", Off::InSDK::ScriptContainers::FScriptSetHelperRemoveElementOffset },
+		{ "FScriptSetHelper::RemoveAt", Off::InSDK::ScriptContainers::FScriptSetHelperRemoveAtOffset },
+		{ "FScriptSetHelper::AddElement", Off::InSDK::ScriptContainers::FScriptSetHelperAddElementOffset },
+		{ "FUObjectArray::AllocateSerialNumber", Off::InSDK::WeakObject::AllocateSerialNumberOffset },
+		{ "FCrc::Strihash_DEPRECATED", Off::InSDK::TypeHash::StrihashOffset },
+		{ "FCrc::MemCrc32", Off::InSDK::TypeHash::MemCrc32Offset },
+		{ "CityHash64", Off::InSDK::TypeHash::CityHash64Offset },
+	};
+
+	for (const auto& [Name, Rva] : Addresses)
+		Off::FoundRva(Name, Rva);
+
 	InitSettings();
+
+	Off::PrintSummary();
+	return true;
 }
 
 void Generator::InitInternal()

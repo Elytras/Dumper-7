@@ -1484,7 +1484,8 @@ std::string CppGenerator::GetMemberTypeStringWithoutConst(UEProperty Member, int
 			return "class UObject*";
 		}
 
-		return std::format("TFieldPath<class {}>", Member.Cast<UEFieldPathProperty>().GetFieldClass().GetCppName());
+		const UEFFieldClass FieldClass = Member.Cast<UEFieldPathProperty>().GetFieldClass();
+		return std::format("TFieldPath<class {}>", FieldClass ? FieldClass.GetCppName() : "FField");
 	}
 	else if (Flags & EClassCastFlags::OptionalProperty)
 	{
@@ -2212,9 +2213,18 @@ static std::string SelectTierBody(std::initializer_list<TierCandidate> Tiers, st
 
 void CppGenerator::InitPredefinedMembers()
 {
+	/* Every member list goes through here before it is used, which is where the members at a missing
+	   offset are dropped. */
 	static auto SortMembers = [](std::vector<PredefinedMember>& Members) -> void
 	{
+		DropMembersAtMissingOffsets(Members);
 		std::sort(Members.begin(), Members.end(), ComparePredefinedMembers);
+	};
+
+	/* A member behind a found one: missing with it. */
+	static auto OffsetPlus = [](int32 Base, int32 Delta) -> int32
+	{
+		return Base == -1 ? -1 : Base + Delta;
 	};
 
 	/* Assumes Members to be sorted */
@@ -2477,6 +2487,15 @@ void CppGenerator::InitPredefinedMembers()
 		},
 	};
 
+	std::vector<PredefinedMember> MulticastDelegatePropertyMembers =
+	{
+		PredefinedMember {
+			.Comment = "NOT AUTO-GENERATED PROPERTY",
+			.Type = "class UFunction*", .Name = "SignatureFunction", .Offset = Off::MulticastDelegateProperty::SignatureFunction, .Size = sizeof(void*), .ArrayDim = 0x1, .Alignment = alignof(void*),
+			.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
+		},
+	};
+
 	std::vector<PredefinedMember> InterfacePropertyMembers =
 	{
 		PredefinedMember {
@@ -2495,7 +2514,7 @@ void CppGenerator::InitPredefinedMembers()
 		},
 		PredefinedMember {
 			.Comment = "NOT AUTO-GENERATED PROPERTY",
-			.Type = PropertyTypePtr, .Name = "ValueProperty", .Offset = Off::MapProperty::Base + (int)sizeof(void*), .Size = sizeof(void*), .ArrayDim = 0x1, .Alignment = alignof(void*),
+			.Type = PropertyTypePtr, .Name = "ValueProperty", .Offset = OffsetPlus(Off::MapProperty::Base, sizeof(void*)), .Size = sizeof(void*), .ArrayDim = 0x1, .Alignment = alignof(void*),
 			.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
 		},
 	};
@@ -2518,7 +2537,7 @@ void CppGenerator::InitPredefinedMembers()
 		},
 		PredefinedMember {
 			.Comment = "NOT AUTO-GENERATED PROPERTY",
-			.Type = "class UEnum*", .Name = "Enum", .Offset = Off::EnumProperty::Base + (int)sizeof(void*), .Size = sizeof(void*), .ArrayDim = 0x1, .Alignment = alignof(void*),
+			.Type = "class UEnum*", .Name = "Enum", .Offset = OffsetPlus(Off::EnumProperty::Base, sizeof(void*)), .Size = sizeof(void*), .ArrayDim = 0x1, .Alignment = alignof(void*),
 			.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
 		},
 	};
@@ -2556,7 +2575,10 @@ void CppGenerator::InitPredefinedMembers()
 	SortMembers(StructPropertyMembers);
 	SortMembers(ArrayPropertyMembers);
 	SortMembers(DelegatePropertyMembers);
+	SortMembers(MulticastDelegatePropertyMembers);
+	SortMembers(InterfacePropertyMembers);
 	SortMembers(MapPropertyMembers);
+	SortMembers(EnumPropertyMembers);
 	SortMembers(SetPropertyMembers);
 	SortMembers(FieldPathPropertyMembers);
 	SortMembers(OptionalPropertyMembers);
@@ -2816,7 +2838,7 @@ void CppGenerator::InitPredefinedMembers()
 		FStructProperty.Properties = StructPropertyMembers;
 		FArrayProperty.Properties = ArrayPropertyMembers;
 		FDelegateProperty.Properties = DelegatePropertyMembers;
-		FMulticastDelegateProperty.Properties = DelegatePropertyMembers;
+		FMulticastDelegateProperty.Properties = MulticastDelegatePropertyMembers;
 		FInterfaceProperty.Properties = InterfacePropertyMembers;
 		FMapProperty.Properties = MapPropertyMembers;
 		FSetProperty.Properties = SetPropertyMembers;

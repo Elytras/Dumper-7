@@ -47,7 +47,8 @@ private:
 	static inline bool bDumepdEditorOnlyMetadata = false;
 
 public:
-    static void InitEngineCore();
+    /* False when an essential offset is missing: nothing may be hooked or dumped then. */
+    static bool InitEngineCore();
     static void InitInternal();
 
 private:
@@ -64,6 +65,8 @@ public:
         {
             if (!SetupDumperFolder())
                 return;
+
+            Off::WriteTable(DumperFolder / "Offsets.txt");
 
             if (!bDumpedGObjects)
             {

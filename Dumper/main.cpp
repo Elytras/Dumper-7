@@ -413,18 +413,23 @@ DWORD MainThread(HMODULE Module)
 
 	/* Offset finding must run first: it resolves the Tick offset/index we hook with. Its GObjects
 	   scans are short; the heavy full-array work happens later inside RunFullDump (GC-protected). */
-	Generator::InitEngineCore();
+	const bool bOffsetsReady = Generator::InitEngineCore();
 
 	/* Resolve the real FGCObject-based keep (GObjects is up now) - cheap (one GObjects scan + two
 	   pattern scans), so just always do it; every KeepAllFromGC/KeepNewFromGC call site benefits.
 	   No-op if this build's engine natives don't match a known shape - callers fall back to
 	   RootSet-only in that case. */
-	GcKeep::Init();
+	if (bOffsetsReady)
+		GcKeep::Init();
 
 	g_DumpStartedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	g_DumpDoneEvent    = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-	if (InstallTickHook())
+	if (!bOffsetsReady)
+	{
+		std::cerr << "[Dumper-7] Nothing hooked or dumped - the game is untouched. See the offset table above.\n";
+	}
+	else if (InstallTickHook())
 	{
 		if (Settings::Config::bKeepObjectsAliveForDump || Settings::Config::bPreloadAssetsBeforeDump)
 		{
@@ -496,7 +501,7 @@ DWORD MainThread(HMODULE Module)
 
 	std::cerr << "\n\nGenerating SDK took (" << DumpTime.count() << "ms)\n\n\n";
 
-	if (Settings::Debug::bExecuteSDKTestScript)
+	if (bOffsetsReady && Settings::Debug::bExecuteSDKTestScript)
 	{
 		/* Executes a python script to test if the SDK compiles correctly. */
 		CppGenerator::ExecuteSDKCompilationTestScript();

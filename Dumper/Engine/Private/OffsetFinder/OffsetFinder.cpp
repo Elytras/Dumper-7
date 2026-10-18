@@ -1068,8 +1068,24 @@ int32_t OffsetFinder::FindScriptOffset()
 
 		NumArrays++;
 
-		NumScripts += ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData)
-			&& !Platform::IsBadReadPtr(ScriptData + ScriptNum - 1) && ScriptData[ScriptNum - 1] == EX_EndOfScript;
+		const bool bReadable = ScriptNum > 0 && ScriptMax >= ScriptNum && !Platform::IsBadReadPtr(ScriptData) && !Platform::IsBadReadPtr(ScriptData + ScriptNum - 1);
+
+		if (bReadable && ScriptData[ScriptNum - 1] == EX_EndOfScript)
+		{
+			NumScripts++;
+			continue;
+		}
+
+		/* The odd ones out, named so a log shows what (a mod's patch, a half-loaded asset) didn't match. */
+		if (NumArrays - NumScripts <= 5)
+		{
+			std::string Tail;
+			for (int32 i = (std::max)(0, ScriptNum - 8); bReadable && i < ScriptNum; i++)
+				Tail += std::format(" {:02X}", ScriptData[i]);
+
+			std::cerr << std::format("UStruct::Script candidate 0x{:X}: {} has Num {} Max {}, last bytes:{}\n",
+				Candidate, Obj.GetFullName(), ScriptNum, ScriptMax, bReadable ? Tail : " (unreadable)");
+		}
 	}
 
 	std::cerr << std::format("UStruct::Script candidate 0x{:X}: {} of {} non-empty arrays end in EX_EndOfScript\n", Candidate, NumScripts, NumArrays);

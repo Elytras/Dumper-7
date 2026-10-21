@@ -16,7 +16,8 @@ namespace
     {
         EX_LocalVariable = 0x00, EX_InstanceVariable = 0x01, EX_DefaultVariable = 0x02,
         EX_Return = 0x04, EX_Jump = 0x06, EX_JumpIfNot = 0x07, EX_Assert = 0x09,
-        EX_Nothing = 0x0B, EX_Let = 0x0F, EX_ClassContext = 0x12, EX_MetaCast = 0x13,
+        EX_Nothing = 0x0B, EX_NothingInt32 = 0x0C, EX_Let = 0x0F, EX_BitFieldConst = 0x11,
+        EX_ClassContext = 0x12, EX_MetaCast = 0x13,
         EX_LetBool = 0x14, EX_EndParmValue = 0x15, EX_EndFunctionParms = 0x16, EX_Self = 0x17,
         EX_Skip = 0x18, EX_Context = 0x19, EX_Context_FailSilent = 0x1A, EX_VirtualFunction = 0x1B,
         EX_FinalFunction = 0x1C, EX_IntConst = 0x1D, EX_FloatConst = 0x1E, EX_StringConst = 0x1F,
@@ -25,9 +26,9 @@ namespace
         EX_TextConst = 0x29, EX_NoObject = 0x2A, EX_TransformConst = 0x2B, EX_IntConstByte = 0x2C,
         EX_NoInterface = 0x2D, EX_DynamicCast = 0x2E, EX_StructConst = 0x2F, EX_EndStructConst = 0x30,
         EX_SetArray = 0x31, EX_EndArray = 0x32, EX_PropertyConst = 0x33, EX_UnicodeStringConst = 0x34,
-        EX_Int64Const = 0x35, EX_UInt64Const = 0x36, EX_PrimitiveCast = 0x38, EX_SetSet = 0x39,
+        EX_Int64Const = 0x35, EX_UInt64Const = 0x36, EX_DoubleConst = 0x37, EX_PrimitiveCast = 0x38, EX_SetSet = 0x39,
         EX_EndSet = 0x3A, EX_SetMap = 0x3B, EX_EndMap = 0x3C, EX_SetConst = 0x3D, EX_EndSetConst = 0x3E,
-        EX_MapConst = 0x3F, EX_EndMapConst = 0x40, EX_StructMemberContext = 0x42,
+        EX_MapConst = 0x3F, EX_EndMapConst = 0x40, EX_Vector3fConst = 0x41, EX_StructMemberContext = 0x42,
         EX_LetMulticastDelegate = 0x43, EX_LetDelegate = 0x44, EX_LocalVirtualFunction = 0x45,
         EX_LocalFinalFunction = 0x46, EX_LocalOutVariable = 0x48, EX_DeprecatedOp4A = 0x4A,
         EX_InstanceDelegate = 0x4B, EX_PushExecutionFlow = 0x4C, EX_PopExecutionFlow = 0x4D,
@@ -56,7 +57,9 @@ const char* BytecodeGenerator::TokenName(uint8 Op)
     case EX_JumpIfNot: return "EX_JumpIfNot";
     case EX_Assert: return "EX_Assert";
     case EX_Nothing: return "EX_Nothing";
+    case EX_NothingInt32: return "EX_NothingInt32";
     case EX_Let: return "EX_Let";
+    case EX_BitFieldConst: return "EX_BitFieldConst";
     case EX_ClassContext: return "EX_ClassContext";
     case EX_MetaCast: return "EX_MetaCast";
     case EX_LetBool: return "EX_LetBool";
@@ -94,6 +97,7 @@ const char* BytecodeGenerator::TokenName(uint8 Op)
     case EX_UnicodeStringConst: return "EX_UnicodeStringConst";
     case EX_Int64Const: return "EX_Int64Const";
     case EX_UInt64Const: return "EX_UInt64Const";
+    case EX_DoubleConst: return "EX_DoubleConst";
     case EX_PrimitiveCast: return "EX_PrimitiveCast";
     case EX_SetSet: return "EX_SetSet";
     case EX_EndSet: return "EX_EndSet";
@@ -103,6 +107,7 @@ const char* BytecodeGenerator::TokenName(uint8 Op)
     case EX_EndSetConst: return "EX_EndSetConst";
     case EX_MapConst: return "EX_MapConst";
     case EX_EndMapConst: return "EX_EndMapConst";
+    case EX_Vector3fConst: return "EX_Vector3fConst";
     case EX_StructMemberContext: return "EX_StructMemberContext";
     case EX_LetMulticastDelegate: return "EX_LetMulticastDelegate";
     case EX_LetDelegate: return "EX_LetDelegate";
@@ -424,14 +429,16 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
         Expr(Depth + 1); Read<int32>();
         while (!bFailed && Expr(Depth + 1) != EX_EndMap) {}
         break;
-    case EX_ArrayConst:
-        SetText(std::format("EX_ArrayConst inner={} count={}", FieldName(ReadPtr()), Read<int32>()));
-        while (!bFailed && Expr(Depth + 1) != EX_EndArrayConst) {}
+    /* One read per statement from here on: the arguments of one std::format call are evaluated in an
+       unspecified order (MSVC goes right to left), so two reads inside it take their operands swapped. */
+    case EX_ArrayConst: case EX_SetConst:
+    {
+        void* Inner = ReadPtr(); const int32 N = Read<int32>();
+        SetText(std::format("{} inner={} count={}", TokenName(Op), FieldName(Inner), N));
+        const uint8 End = Op == EX_ArrayConst ? EX_EndArrayConst : EX_EndSetConst;
+        while (!bFailed && Expr(Depth + 1) != End) {}
         break;
-    case EX_SetConst:
-        SetText(std::format("EX_SetConst inner={} count={}", FieldName(ReadPtr()), Read<int32>()));
-        while (!bFailed && Expr(Depth + 1) != EX_EndSetConst) {}
-        break;
+    }
     case EX_MapConst:
     {
         void* K = ReadPtr(); void* V = ReadPtr(); const int32 N = Read<int32>();
@@ -445,6 +452,22 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
     case EX_UInt64Const:     SetText(std::format("EX_UInt64Const {}", Read<uint64>())); break;
     case EX_SkipOffsetConst: SetText(std::format("EX_SkipOffsetConst {}", Read<CodeSkipSizeType>())); break;
     case EX_FloatConst:      SetText(std::format("EX_FloatConst {}", Read<float>())); break;
+
+    // UE5-only tokens; operand shapes from UE5.6 UStruct::SerializeExpr (ScriptSerialization.h).
+    case EX_DoubleConst:     SetText(std::format("EX_DoubleConst {}", Read<double>())); break;
+    case EX_NothingInt32:    SetText(std::format("EX_NothingInt32 {}", Read<int32>())); break;
+    case EX_BitFieldConst:
+    {
+        void* Field = ReadPtr(); const int V = static_cast<int>(Read<uint8>());
+        SetText(std::format("EX_BitFieldConst {} = {}", FieldName(Field), V));
+        break;
+    }
+    case EX_Vector3fConst:
+    {
+        const float X = Read<float>(), Y = Read<float>(), Z = Read<float>();
+        SetText(std::format("EX_Vector3fConst ({}, {}, {})", X, Y, Z));
+        break;
+    }
     case EX_ByteConst: case EX_IntConstByte:
         SetText(std::format("{} {}", TokenName(Op), static_cast<int>(Read<uint8>()))); break;
     case EX_StringConst:     SetText(std::format("EX_StringConst \"{}\"", ReadAsciiString())); break;
@@ -453,11 +476,15 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
     case EX_NameConst:       SetText(std::format("EX_NameConst {}", ReadName())); break;
 
     case EX_RotationConst:
+        // FRotator: Pitch, Yaw, Roll, doubles under LWC and floats on UE4.
         if (Settings::Internal::bUseLargeWorldCoordinates)
-            SetText(std::format("EX_RotationConst ({}, {}, {})", Read<double>(), Read<double>(), Read<double>()));
+        {
+            const double P = Read<double>(), Y = Read<double>(), R = Read<double>();
+            SetText(std::format("EX_RotationConst ({}, {}, {})", P, Y, R));
+        }
         else
         {
-            const int32 P = Read<int32>(), Y = Read<int32>(), R = Read<int32>();
+            const float P = Read<float>(), Y = Read<float>(), R = Read<float>();
             SetText(std::format("EX_RotationConst ({}, {}, {})", P, Y, R));
         }
         break;

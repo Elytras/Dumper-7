@@ -980,6 +980,11 @@ void CppGenerator::GenerateEnum(const EnumWrapper& Enum, StreamType& StructFile)
 	if (!MemberString.empty()) [[likely]]
 		MemberString.pop_back();
 
+	/* A Blueprint enum's comment spells its package by path, as a struct's does (bFullAssetPaths): the short name alone
+	   cannot tell apart two enums of one name, which genueapi namespaces by path. A native enum's stays as it was. */
+	const UEEnum UnrealEnum = Enum.GetUnrealEnum();
+	const bool bPathName = Settings::Config::bFullAssetPaths && UnrealEnum.GetClass().GetName() == "UserDefinedEnum";
+
 	StructFile << std::format(R"(
 // {}
 // NumValues: 0x{:04X}
@@ -987,7 +992,7 @@ enum class {} : {}
 {{
 {}
 }};
-)", Enum.GetFullName()
+)", bPathName ? UnrealEnum.GetPathName() : Enum.GetFullName()
   , NumValues
   , GetEnumPrefixedName(Enum)
   , GetEnumUnderlyingType(Enum)

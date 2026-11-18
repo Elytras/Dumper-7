@@ -287,7 +287,7 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
     const uint8 Op = Code[Idx++];
 
     const size_t InsnIdx = Out->size();
-    Out->push_back(FInsn{ OpOff, Op, Depth, TokenName(Op) });
+    Out->push_back(FInsn{ OpOff, Op, Depth, TokenName(Op), InContext == 0 });
     auto SetText = [&](std::string S) { (*Out)[InsnIdx].Text = std::move(S); };
     auto Parms = [&]() { while (!bFailed && Expr(Depth + 1) != EX_EndFunctionParms) {} };
 
@@ -359,7 +359,9 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
         Expr(Depth + 1);                  // object expr
         Read<CodeSkipSizeType>();         // skip-to offset for null context
         ReadPtr();                        // r-value FField* (may be null)
+        ++InContext;
         Expr(Depth + 1);                  // context expr
+        --InContext;
         break;
 
     case EX_CallMath: case EX_LocalFinalFunction: case EX_FinalFunction:
@@ -551,18 +553,18 @@ uint8 BytecodeGenerator::FWalker::Expr(int32 Depth)
     return Op;
 }
 
-void BytecodeGenerator::DisassembleFunction(UEFunction Func, std::vector<FInsn>& Out)
+bool BytecodeGenerator::DisassembleFunction(UEFunction Func, std::vector<FInsn>& Out)
 {
     /* UStruct::Script (TArray<uint8>), where Off::Init() found it; nothing is read if it didn't. */
     if (Off::UStruct::Script == -1)
-        return;
+        return true;
 
     auto* Base = reinterpret_cast<uint8*>(Func.GetAddress());
     const uint8* Data = *reinterpret_cast<uint8**>(Base + Off::UStruct::Script);
     const int32 Num = *reinterpret_cast<int32*>(Base + Off::UStruct::Script + 0x8);
 
     if (!Data || Num <= 0)
-        return;   // native function, no bytecode
+        return true;   // native function, no bytecode
 
     const std::string FuncName = Func.GetFullName();
 
@@ -578,6 +580,7 @@ void BytecodeGenerator::DisassembleFunction(UEFunction Func, std::vector<FInsn>&
         if (++Guard > Num + 8)
             break;
     }
+    return !Walker.bFailed;
 }
 
 void BytecodeGenerator::WriteFunction(StreamType& File, UEFunction Func)

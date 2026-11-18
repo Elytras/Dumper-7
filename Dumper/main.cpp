@@ -14,6 +14,7 @@
 #include "Generators/IDAMappingGenerator.h"
 #include "Generators/DumpspaceGenerator.h"
 #include "Generators/BytecodeGenerator.h"
+#include "Generators/UnityGenerator.h"
 
 #include "Generators/Generator.h"
 
@@ -161,6 +162,10 @@ static void RunFullDump()
 	Generator::Generate<IDAMappingGenerator>();
 	Generator::Generate<DumpspaceGenerator>();
 	Generator::Generate<BytecodeGenerator>();
+
+	/* Last: it packs what the generators above wrote. */
+	if (!Generator::GetDumperFolder().empty())
+		UnityGenerator::Generate(Generator::GetDumperFolder());
 }
 
 /* ---- Game-thread synchronization via a UGameEngine::Tick vtable hook ---- */

@@ -57,6 +57,14 @@ namespace
 
 	struct FScriptArray { uint8* Data; int32 Num; int32 Max; };
 
+	/* FUObjectItem::Flags, the EInternalObjectFlags beside the object pointer (UObjectArray.h): PendingKill (4.27's
+	   1 << 29, 5.x's Garbage 1 << 21) is there, which the cook does not export. */
+	int32 ItemFlags(UEObject Obj)
+	{
+		auto* Item = reinterpret_cast<uint8*>(ObjectArray::GetItemAddress(Obj.GetIndex()));
+		return Item ? *reinterpret_cast<int32*>(Item + sizeof(void*)) : 0;
+	}
+
 	/* The game section's builder: the live objects of the game's own .uasset packages (/Game, no map). */
 	struct FGame
 	{
@@ -153,10 +161,10 @@ namespace
 			Out["classes"][Path] = { ClassFlags(C), Within ? PyPath(Within) : "/Script/CoreUObject.Object", ClassConfig(C),
 			                         Super ? PyPath(Super) : "", Interfaces };
 
-			/* Every default subobject or archetype under the CDO, at any depth. Beside each, its object flags and how many
-			   object references inside the CDO's subtree name it: the cook exports only what serializing the package
-			   reaches, which leaves out a subobject nothing points at (an AI controller's PathFollowingComponent whose
-			   member the class clears). genueapi decides with these which to keep. */
+			/* Every default subobject or archetype under the CDO, at any depth. Beside each, its object flags, how many
+			   object references inside the CDO's subtree name it, and its internal flags. The cook leaves out one the
+			   class's constructor destroyed, which stays in memory flagged PendingKill (4.27) / Garbage (5.x): every FSD AI
+			   controller's PathFollowingComponent. genueapi drops those by these flags. */
 			UEObject Cdo = C.GetDefaultObject();
 			json& Subs = Out["subobjects"][Path] = json::array();
 			json& Info = Out["subobject_info"][Path] = json::array();
@@ -173,7 +181,7 @@ namespace
 					if (!(Flags(X) & (RF_DefaultSubObject | RF_ArchetypeObject)) || (Flags(X) & RF_Transient))
 						continue;
 					Subs.push_back(PyPath(X.GetClass()) + " " + NamePath);
-					Info.push_back({ Flags(X), Refs[const_cast<void*>(X.GetAddress())] });
+					Info.push_back({ Flags(X), Refs[const_cast<void*>(X.GetAddress())], ItemFlags(X) });
 				}
 			}
 

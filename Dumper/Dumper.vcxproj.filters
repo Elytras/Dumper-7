@@ -44,6 +44,9 @@
     <ClCompile Include="Generator\Private\Generators\BytecodeGenerator.cpp">
       <Filter>Generator\Private\Generators</Filter>
     </ClCompile>
+    <ClCompile Include="Generator\Private\Generators\UnityGenerator.cpp">
+      <Filter>Generator\Private\Generators</Filter>
+    </ClCompile>
     <ClCompile Include="Utils\Dumpspace\DSGen.cpp">
       <Filter>Utils\Dumpspace</Filter>
     </ClCompile>
@@ -206,6 +209,9 @@
       <Filter>Generator\Public\Generators</Filter>
     </ClInclude>
     <ClInclude Include="Generator\Public\Generators\BytecodeGenerator.h">
+      <Filter>Generator\Public\Generators</Filter>
+    </ClInclude>
+    <ClInclude Include="Generator\Public\Generators\UnityGenerator.h">
       <Filter>Generator\Public\Generators</Filter>
     </ClInclude>
     <ClInclude Include="Generator\Public\PredefinedMembers.h">

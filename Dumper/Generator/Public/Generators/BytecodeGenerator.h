@@ -30,6 +30,7 @@ public:
 private:
     using StreamType = std::ofstream;
 
+public:
     /* One decoded instruction. `Offset` is the opcode byte's position in Script; `Depth` is
        sub-expression nesting (drives indentation). */
     struct FInsn
@@ -38,8 +39,12 @@ private:
         uint8 Op = 0;
         int32 Depth = 0;
         std::string Text;
+        /* Whether it runs on the function's own object: false under the context expression of an EX_Context /
+           EX_Context_FailSilent / EX_ClassContext, which runs on the context object (UnityGenerator's self calls). */
+        bool bOnSelf = true;
     };
 
+private:
     /* Walks a single UFunction's bytecode, mirroring UStruct::SerializeExpr. */
     struct FWalker
     {
@@ -49,6 +54,7 @@ private:
         bool bFailed = false;
         std::vector<FInsn>* Out = nullptr;
         const std::string* FuncName = nullptr;
+        int32 InContext = 0;              /* how many context expressions the walk is inside */
 
         bool Want(int32 N);
 
@@ -80,12 +86,12 @@ private:
     /* Guarded name of an FField / UEFField pointer baked into bytecode. */
     static std::string FieldName(void* Ptr);
 
-    /* Disassembles one function's Script into Out; empty if native or on decode failure. */
-    static void DisassembleFunction(UEFunction Func, std::vector<FInsn>& Out);
-
     static void WriteFunction(StreamType& File, UEFunction Func);
 
 public:
+    /* Disassembles one function's Script into Out; empty if native. Returns false on a decode failure. */
+    static bool DisassembleFunction(UEFunction Func, std::vector<FInsn>& Out);
+
     static void Generate();
 
     /* Always empty, there are no predefined members for the bytecode dump */

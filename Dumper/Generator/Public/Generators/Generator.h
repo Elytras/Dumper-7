@@ -51,6 +51,9 @@ public:
     static bool InitEngineCore();
     static void InitInternal();
 
+    /* The dump's folder, once a generator made it (empty before). */
+    static const fs::path& GetDumperFolder() { return DumperFolder; }
+
 private:
     static bool SetupDumperFolder();
 

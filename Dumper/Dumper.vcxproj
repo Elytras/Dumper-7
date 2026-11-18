@@ -329,6 +329,7 @@
     <ClCompile Include="Generator\Private\Generators\Generator.cpp" />
     <ClCompile Include="Generator\Private\HashStringTable.cpp" />
     <ClCompile Include="Generator\Private\Generators\BytecodeGenerator.cpp" />
+    <ClCompile Include="Generator\Private\Generators\UnityGenerator.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Generator\Private\Generators\MappingGenerator.cpp" />
     <ClCompile Include="Generator\Private\Wrappers\MemberWrappers.cpp" />
@@ -357,6 +358,7 @@
     <ClInclude Include="Generator\Public\Generators\Generator.h" />
     <ClInclude Include="Generator\Public\HashStringTable.h" />
     <ClInclude Include="Generator\Public\Generators\BytecodeGenerator.h" />
+    <ClInclude Include="Generator\Public\Generators\UnityGenerator.h" />
     <ClInclude Include="Generator\Public\Generators\MappingGenerator.h" />
     <ClInclude Include="Generator\Public\Wrappers\MemberWrappers.h" />
     <ClInclude Include="Generator\Public\Managers\CollisionManager.h" />
